@@ -27,6 +27,9 @@ def isa_for(machine):
 
 
 def build(args):
+    output_dir = args.out.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "tests.img").unlink(missing_ok=True)
     suites = (args.suite.split(",") if args.suite != "all" else
               ["libctest", "picolibc", "posixtst", "busybox"])
     unknown = sorted(set(suites) - {"libctest"})
@@ -41,7 +44,7 @@ def build(args):
     targets = args.targets.split(",")
     if not targets or len(set(targets)) != len(targets):
         raise RuntimeError("TARGETS must be a comma-separated set of ISA names")
-    artifact_root = args.out.resolve() / "artifacts"
+    artifact_root = output_dir / "artifacts"
     for suite in suites:
         for target in targets:
             if target == "x86_64":
@@ -52,7 +55,7 @@ def build(args):
                 compiler = args.rv32_cc
             else:
                 raise RuntimeError(f"unsupported ISA target: {target}")
-            temporary = args.out.resolve() / "compat" / target
+            temporary = output_dir / "compat" / target
             run([sys.executable, str(RUNNER), "build", "--target", "linux", "--cc", compiler,
                  "--out", str(temporary)])
             build_root = temporary / "linux"
@@ -70,10 +73,10 @@ def build(args):
             if not any(suite_root.iterdir()):
                 raise RuntimeError(f"{suite}/{target}: compiler produced no test programs")
     run([sys.executable, str(IMAGE), "pack", "--input", str(artifact_root),
-         "--suites", ",".join(suites), "--output", str(args.out.resolve() / "tests.img")])
+         "--suites", ",".join(suites), "--output", str(output_dir / "tests.img")])
     run([sys.executable, str(IMAGE), "verify", "--input", str(artifact_root),
-         "--suites", ",".join(suites), "--image", str(args.out.resolve() / "tests.img")])
-    print(f"test image ready: {args.out.resolve() / 'tests.img'}")
+         "--suites", ",".join(suites), "--image", str(output_dir / "tests.img")])
+    print(f"test image ready: {output_dir / 'tests.img'}")
 
 
 def main():
