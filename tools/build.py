@@ -282,7 +282,7 @@ def build(args):
     suites = args.suite.split(",") if args.suite != "all" else [
         "libctest", "picolibc", "busybox"]
     if args.suite == "all" and "x86_64" in args.targets.split(","):
-        suites.insert(2, "openposix")
+        suites.append("openposix")
     if not suites or len(set(suites)) != len(suites):
         raise RuntimeError("SUITE must be a non-empty, duplicate-free list")
     if "ltp" in suites:
@@ -290,6 +290,8 @@ def build(args):
     unknown = sorted(set(suites) - {"libctest", "picolibc", "openposix", "busybox"})
     if unknown:
         raise RuntimeError("unknown suites: " + ", ".join(unknown))
+    if "openposix" in suites:
+        suites = [suite for suite in suites if suite != "openposix"] + ["openposix"]
     targets = args.targets.split(",")
     if not targets or len(set(targets)) != len(targets):
         raise RuntimeError("TARGETS must be a comma-separated set of ISA names")

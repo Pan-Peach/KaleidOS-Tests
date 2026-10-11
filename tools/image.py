@@ -2,13 +2,15 @@
 """Create and verify the shared Suite/ISA FAT or ext4 test disk."""
 
 import argparse
-import json
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import time
+
+from shell_image import prepare
 
 
 def command(args):
@@ -70,6 +72,8 @@ def pack(args):
     output.parent.mkdir(parents=True, exist_ok=True)
     output.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="kaleidos-test-image-") as temporary:
+        selected, cases_file = prepare(args.input.resolve(), args.suites.split(","),
+                                       selected, Path(temporary) / "shell")
         image = Path(temporary) / "tests.img"
         payload_bytes = sum(source.stat().st_size for source, *_rest in selected)
         reserve = max(4 * 1024 * 1024, payload_bytes // 8)
@@ -78,37 +82,15 @@ def pack(args):
         image.touch()
         with image.open("r+b") as disk:
             disk.truncate(image_bytes)
-        image_paths = {source_relative: image_relative
-                       for _source, source_relative, image_relative, _kind in selected}
-        runlist = []
-        artifact_root = args.input.resolve()
-        for suite in args.suites.split(","):
-            for isa_root in sorted(path for path in (artifact_root / suite).iterdir() if path.is_dir()):
-                sidecar = isa_root / ".runlist.json"
-                if not sidecar.is_file():
-                    continue
-                data = json.loads(sidecar.read_text(encoding="utf-8"))
-                if suite == "busybox":
-                    runlist.append({"suite": "busybox", "isa": isa_root.name,
-                                    "applets": data["applets"]})
-                    row = runlist[-1]
-                    for key in ("binary", "config", "tests", "echo"):
-                        row[key] = image_paths[data[key]]
-                else:
-                    for row in data:
-                        relative = row.get("source")
-                        runlist.append({**row, "suite": suite, "isa": isa_root.name,
-                                        "image": image_paths.get(relative)})
-        runlist_file = Path(temporary) / "RUNLIST.TXT"
-        runlist_file.write_text(json.dumps(runlist, indent=2) + "\r\n", encoding="utf-8")
-        harness = Path(__file__).with_name("testharness.py")
+        runlist_file = cases_file
+        harness = Path(__file__).with_name("testharness.sh")
         if not harness.is_file():
-            raise RuntimeError("tools/testharness.py is missing")
-        lines = [f"KaleidOS unified {args.fs} test disk; run python3 /RUNTEST.PY on Linux.",
+            raise RuntimeError("tools/testharness.sh is missing")
+        lines = [f"KaleidOS unified {args.fs} test disk; run sh /RUNTEST.SH.",
                  "image path | format and ABI | original test name"]
         for source, source_relative, image_relative, kind in selected:
             _suite, isa, _name = image_relative.split("/", 2)
-            machine_file = source.parent / ".machine"
+            machine_file = args.input.resolve() / _suite / isa / ".machine"
             machine = machine_file.read_text(encoding="ascii").strip() if machine_file.is_file() else "unknown"
             if kind == "PE":
                 environment = f"{machine}; Windows PE, no KaleidOS PE loader"
@@ -134,7 +116,7 @@ def pack(args):
                         created.add(parent)
             for source, _source_relative, image_relative, _kind in selected:
                 command(["mcopy", "-o", "-i", str(image), str(source), f"::/{image_relative}"])
-            for source, destination in ((harness, "RUNTEST.PY"),
+            for source, destination in ((harness, "RUNTEST.SH"),
                                         (runlist_file, "RUNLIST.TXT"),
                                         (tests_file, "TESTS.TXT")):
                 command(["mcopy", "-o", "-i", str(image), str(source), f"::/{destination}"])
@@ -145,7 +127,7 @@ def pack(args):
                 destination = stage / image_relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination)
-            shutil.copy2(harness, stage / "RUNTEST.PY")
+            shutil.copy2(harness, stage / "RUNTEST.SH")
             shutil.copy2(runlist_file, stage / "RUNLIST.TXT")
             shutil.copy2(tests_file, stage / "TESTS.TXT")
             command(["mke2fs", "-q", "-F", "-t", "ext4", "-L", "KALEIDOST",
@@ -156,16 +138,23 @@ def pack(args):
 
 
 def verify(args):
+    found = entries(args.input.resolve(), args.suites.split(","), args.fs)
+    with tempfile.TemporaryDirectory(prefix="kaleidos-shell-verify-") as temporary:
+        found, cases_file = prepare(args.input.resolve(), args.suites.split(","),
+                                    found, Path(temporary))
+        return verify_prepared(args, found, cases_file)
+
+
+def verify_prepared(args, found, cases_file):
     image = args.image.resolve()
     if not image.is_file():
         raise RuntimeError(f"image not found: {image}")
-    found = entries(args.input.resolve(), args.suites.split(","), args.fs)
     if args.fs == "ext4":
-        return verify_ext4(args, image, found)
+        return verify_ext4(args, image, found, cases_file)
     if args.fs != "fat":
         raise RuntimeError("FS must be fat or ext4")
     listing = command(["mdir", "-i", str(image), "::/"])
-    for required in (r"TESTS\s+TXT", r"RUNLIST\s+TXT", r"RUNTEST\s+PY"):
+    for required in (r"TESTS\s+TXT", r"RUNLIST\s+TXT", r"RUNTEST\s+SH"):
         if not re.search(required, listing):
             raise RuntimeError(f"FAT root file is missing: {required}")
     recursive = command(["mdir", "-s", "-/", "-i", str(image), "::/"])
@@ -184,7 +173,7 @@ def verify(args):
             name = f"{file_entry.group(1)}.{file_entry.group(2)}"
             actual_files.add(f"{current_directory}/{name}" if current_directory else name)
     expected_files = {image_relative for _source, _source_relative, image_relative, _kind in found}
-    expected_files.update({"TESTS.TXT", "RUNLIST.TXT", "RUNTEST.PY"})
+    expected_files.update({"TESTS.TXT", "RUNLIST.TXT", "RUNTEST.SH"})
     expected_directories = {"/".join(parts) for suite, isa, _name in
                             (relative.split("/", 2) for relative in expected_files if "/" in relative)
                             for parts in ((suite,), (suite, isa))}
@@ -209,16 +198,16 @@ def verify(args):
             short_names = [f"{base}.{extension}" for base, extension in aliases]
             if len(short_names) != len(paths) or len(set(short_names)) != len(short_names):
                 raise RuntimeError(f"FAT 8.3 names are missing or collide in {suite}/{isa}")
-        for _source, source_relative, image_relative, kind in found:
+        for source, source_relative, image_relative, kind in found:
             suite, isa, _name = image_relative.split("/", 2)
             extracted = destination / image_relative
             extracted.parent.mkdir(parents=True, exist_ok=True)
             command(["mcopy", "-i", str(image), f"::/{image_relative}", str(extracted)])
-            original = args.input.resolve() / source_relative
+            original = source
             if extracted.stat().st_size != original.stat().st_size:
                 raise RuntimeError(f"size changed in FAT image: {image_relative}")
             command(["cmp", "--", str(original), str(extracted)])
-            if args.run_native and isa == "x86_64" and kind == "ELF":
+            if args.run_native and suite == "libctest" and isa == "x86_64" and kind == "ELF":
                 extracted.chmod(0o755)
                 run_directory = destination / ("run-" + source_relative.replace("/", "_"))
                 run_directory.mkdir()
@@ -245,20 +234,13 @@ def verify(args):
         for _source, source_relative, image_relative, _kind in found:
             if image_relative not in declared or f"source {source_relative}" not in declared:
                 raise RuntimeError(f"missing manifest mapping: {source_relative}")
-        for root_file in ("RUNLIST.TXT", "RUNTEST.PY"):
+        for root_file, source in (("RUNLIST.TXT", cases_file),
+                                  ("RUNTEST.SH", Path(__file__).with_name("testharness.sh"))):
             extracted_root = destination / root_file
             command(["mcopy", "-i", str(image), f"::/{root_file}", str(extracted_root)])
-            source = Path(__file__).with_name("testharness.py") if root_file == "RUNTEST.PY" else None
-            if source and source.read_bytes() != extracted_root.read_bytes():
-                raise RuntimeError("RUNTEST.PY differs from the source harness")
-            if root_file == "RUNLIST.TXT":
-                runlist = json.loads(extracted_root.read_text(encoding="utf-8"))
-                for row in runlist:
-                    paths = ([row.get("image")] if row.get("image") else [])
-                    paths.extend(row.get(key) for key in ("binary", "config", "tests", "echo"))
-                    for path in paths:
-                        if path and path not in expected_files:
-                            raise RuntimeError(f"RUNLIST.TXT references a missing image path: {path}")
+            if source.read_bytes() != extracted_root.read_bytes():
+                raise RuntimeError(f"{root_file} differs from the source")
+        verify_runlist(cases_file, expected_files)
         if reference_rows and log_root:
             report = ["path\tstatus\texit_status"]
             report.extend(f"{path}\t{status}\t{code}" for path, status, code in reference_rows)
@@ -268,19 +250,19 @@ def verify(args):
     return 0
 
 
-def verify_ext4(args, image, found):
+def verify_ext4(args, image, found, cases_file):
     with tempfile.TemporaryDirectory(prefix="kaleidos-ext4-verify-") as temporary:
         destination = Path(temporary)
         command(["debugfs", "-R", f"rdump / {destination}", str(image)])
         expected_files = {image_relative for _source, _source_relative, image_relative, _kind in found}
-        expected_files.update({"TESTS.TXT", "RUNLIST.TXT", "RUNTEST.PY"})
+        expected_files.update({"TESTS.TXT", "RUNLIST.TXT", "RUNTEST.SH"})
         actual_files = {path.relative_to(destination).as_posix()
                         for path in destination.rglob("*") if path.is_file()}
         if actual_files != expected_files:
             raise RuntimeError(f"ext4 file list differs: expected {sorted(expected_files)}, found {sorted(actual_files)}")
         for source, source_relative, image_relative, _kind in found:
             extracted = destination / image_relative
-            original = args.input.resolve() / source_relative
+            original = source
             if extracted.stat().st_size != original.stat().st_size:
                 raise RuntimeError(f"size changed in ext4 image: {image_relative}")
             command(["cmp", "--", str(original), str(extracted)])
@@ -298,18 +280,20 @@ def verify_ext4(args, image, found):
         for _source, source_relative, image_relative, _kind in found:
             if image_relative not in declared or f"source {source_relative}" not in declared:
                 raise RuntimeError(f"missing manifest mapping: {source_relative}")
-        harness = Path(__file__).with_name("testharness.py")
-        if harness.read_bytes() != (destination / "RUNTEST.PY").read_bytes():
-            raise RuntimeError("RUNTEST.PY differs from the source harness")
-        runlist = json.loads((destination / "RUNLIST.TXT").read_text(encoding="utf-8"))
-        for row in runlist:
-            paths = ([row.get("image")] if row.get("image") else [])
-            paths.extend(row.get(key) for key in ("binary", "config", "tests", "echo"))
-            for path in paths:
-                if path and path not in expected_files:
-                    raise RuntimeError(f"RUNLIST.TXT references a missing image path: {path}")
+        for root_file, source in (("RUNLIST.TXT", cases_file),
+                                  ("RUNTEST.SH", Path(__file__).with_name("testharness.sh"))):
+            if source.read_bytes() != (destination / root_file).read_bytes():
+                raise RuntimeError(f"{root_file} differs from the source")
+        verify_runlist(cases_file, expected_files)
     print(f"ext4 verified: {image} ({len(found)} artifacts readable and identical)")
     return 0
+
+
+def verify_runlist(manifest, expected_files):
+    for line in manifest.read_text().splitlines():
+        fields = line.split("|")
+        if len(fields) != 8 or fields[3] not in expected_files:
+            raise RuntimeError(f"invalid shell run manifest row: {line}")
 
 
 def main():
@@ -332,7 +316,7 @@ def main():
     args = parser.parse_args()
     try:
         return args.run(args)
-    except (OSError, RuntimeError, UnicodeError) as error:
+    except (OSError, RuntimeError, UnicodeError, ValueError, tarfile.TarError) as error:
         parser.error(str(error))
 
 

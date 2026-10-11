@@ -1,10 +1,13 @@
 # KaleidOS-Tests
 
-This repository pins upstream user-space suites and builds them into one FAT
-image organized by suite and ISA. The image includes `RUNTEST.PY`, which detects
-the Linux host ISA and runs only compatible packaged tests. It writes
-`RESULTS.TXT` to the mounted image when the filesystem is writable; pass
-`--logs DIR` to save a host-side copy and per-test output.
+This repository pins upstream user-space suites and builds them into one FAT or ext4
+image organized by suite and ISA. Every image includes the POSIX shell entry
+`RUNTEST.SH`, its plain-text `RUNLIST.TXT`, per-case shell entries, and test
+binaries/data. The same entry runs on Linux and on a guest with a working `sh`
+and the required POSIX facilities. Runtime execution does not require Python,
+JSON parsing, or archive extraction. Python remains a build-host dependency.
+Results and per-case output go to `logs/` beside the entry; use `--logs DIR`
+for a writable location outside the image.
 
 ## Included suites
 
@@ -44,12 +47,26 @@ git -C tests/kaleidos-tests submodule update --init third_party/libc-test third_
 sh tests/kaleidos-tests/tools/prepare-openposix.sh
 make test TARGET=linux SUITE=all
 make test TARGET=linux FS=ext4 SUITE=all
+make test TARGET=linux ACTION=build FS=ext4 SUITE=all
+make test TARGET=linux ACTION=run FS=ext4 SUITE=all
 ```
 
-The command builds `build/tests/test-linux-<FS>-all/tests.img`, mounts it on
-Linux, and runs the packaged harness. If the environment does not expose loop
-devices, it extracts the verified image to a temporary directory and runs the
-same harness there. `FS=fat` is the default; `FS=ext4` creates a native ext4
+`ACTION=build` creates `build/tests/test-linux-<FS>-<SUITE>/tests.img`.
+The Picolibc and BusyBox build adapters currently perform reference checks
+while preparing their artifacts; disk execution is a separate action.
+`ACTION=run` uses an existing image without rebuilding it;
+`ACTION=all` is the default and performs both steps. The run action calls
+`tools/run-mounted.sh`, which mounts the image on Linux and runs `RUNTEST.SH`.
+If loop mounting is unavailable, it extracts the verified image to a temporary
+directory and runs the same harness there. For a selected run without Make:
+
+```sh
+sh tests/kaleidos-tests/tools/run-mounted.sh build/tests/test-linux-ext4-all/tests.img build/tests/test-linux-ext4-all/logs ext4 --suite libctest,busybox
+```
+
+You can also mount the image yourself
+and run `sh RUNTEST.SH --logs <directory>` directly. `FS=fat` is the
+default; `FS=ext4` creates a native ext4
 disk with full filenames. FAT requires mtools and dosfstools; ext4 requires
 e2fsprogs. Both need loop mount permission for direct mounting. To mount and
 inspect the default FAT disk manually:
@@ -58,8 +75,8 @@ inspect the default FAT disk manually:
 sudo mkdir -p /mnt/kaleidos-tests
 sudo mount -o "loop,exec,uid=$(id -u),gid=$(id -g),umask=022" build/tests/test-linux-fat-all/tests.img /mnt/kaleidos-tests
 cd /mnt/kaleidos-tests
-python3 RUNTEST.PY --logs "$HOME/kaleidos-test-logs"
-cat RESULTS.TXT
+sh RUNTEST.SH --logs "$HOME/kaleidos-test-logs"
+cat "$HOME/kaleidos-test-logs/RESULTS.TXT"
 cd -
 sudo umount /mnt/kaleidos-tests
 ```
@@ -73,7 +90,9 @@ sudo mount -o loop,exec build/tests/test-linux-ext4-all/tests.img /mnt/kaleidos-
 ext4 preserves the full artifact filenames and file modes.
 
 Select suites with `SUITE=libctest`, `SUITE=picolibc`, `SUITE=openposix`,
-`SUITE=busybox`, or a comma-separated combination. Missing compilers or build
+`SUITE=busybox`, or a comma-separated combination. `SUITE=all` runs libctest,
+picolibc, busybox, then openposix; Open POSIX is placed last for an explicit
+suite list too. Missing compilers or build
 tools are reported as errors; Open POSIX also requires Autoconf. The run
 harness prints each suite between
 separators, colors PASS green, FAIL red, and WARN/SKIP yellow on interactive
@@ -81,26 +100,58 @@ terminals, prints each test's captured output beneath its result, and reports
 Open POSIX exit codes for unsupported and untested cases as `SKIP`, unresolved
 cases as `WARN`, and incompatible ISAs as `SKIP`. Cases requiring unavailable
 host privileges are also skipped; a skip is never counted as a pass. Use
-`--color always` or `--color never` when running `RUNTEST.PY` directly to
+`--color always` or `--color never` when running `RUNTEST.SH` directly to
 override terminal detection.
 
 ## KaleidOS image
 
 `make test TARGET=kaleid ARCH=rv64 SUITE=libctest` builds an ISA-specific FAT
-image and boots it as KaleidOS's FAT root disk. The current guest does not
-provide Python or enough POSIX/ELF support to run these upstream suites
-automatically. Guest execution remains manual and limited by the capabilities
-listed in KaleidOS `STATUS.md`; Linux host results do not establish KaleidOS
-compatibility.
+image containing **the same shell harness** and boots it as KaleidOS's FAT root
+disk. Once a real POSIX shell and the necessary userspace APIs are available,
+the guest entry is:
+
+```sh
+sh /fat/RUNTEST.SH --isa rv64 --logs /local/test-logs
+```
+
+This is the intended guest invocation, not a command supported by today's
+`ksh`: the current monitor has no script interpreter, and the POSIX personality
+still lacks the general file/process facilities needed by a shell. This change
+packages the orchestration; it does not implement those kernel/user-space APIs.
+The shell interpreter itself must be provided by the system. ISA matching also
+does not prove ELF/libc/syscall compatibility. BusyBox, Picolibc, and Open POSIX
+currently have x86_64 Linux build adapters; they are skipped on RV64. Linux
+results do not establish KaleidOS compatibility.
+
+The harness checks ISA, required utility availability and, on Linux, the known
+privileged cases before starting tests. It requires `sh`, `cp`, `chmod`, `mkdir`,
+`rm`, `sed`, a writable work directory (`TMPDIR`, default `/tmp`), and `timeout`
+with `-k` support to bound blocking cases. BusyBox also requires `ln` and the
+utilities used by its upstream tests. Missing launch prerequisites are reported
+as SKIP; upstream unsupported/untested results remain SKIP, not PASS. A run in
+which no case executes returns 2. Actual syscall behavior is assessed by the
+cases, rather than inferred from the OS name.
+
+Use `--suite libctest,busybox`, `--case mmap_11-4`, or `--color always` to select
+cases and output style. `uname -m` detects ISA when available; `--isa` supplies
+it on a system without `uname`.
 
 ## Image layout and licenses
 
 FAT images use readable, collision-checked 8.3 filenames because KaleidOS
 FatFs disables long filenames. ext4 images keep full filenames for Linux host
-use. Both include `TESTS.TXT` mappings and the machine-readable `RUNLIST.TXT`.
+use. Generated shell entries and flattened runtime assets use short names in
+both formats. Both include `TESTS.TXT` mappings and a UTF-8, LF-terminated `RUNLIST.TXT`.
+Its pipe-separated fields are `suite|isa|name|entry|timeout|build_status|reason|requires`.
+Each entry is a shell file with safely quoted arguments and environment values.
+Open POSIX executables and BusyBox testsuite assets are unpacked on the build
+host and assigned flat names compatible with FAT 8.3; the BusyBox entry restores
+its required working tree before execution. Run reports use
+`suite|isa|name|status|detail`, with output in `case-N.log` in report order.
+Older Python-runner images must be rebuilt before using this entry.
 Build products stay under KaleidOS `build/` and do not modify upstream checkouts.
 
 Upstream copyright and license files remain in each source submodule. BusyBox
 binary redistribution must follow its GPL-2.0-or-later terms for the exact
 configuration. The selected BusyBox testsuite files retain their upstream
-notices in the packaged archive.
+notices in the packaged files.

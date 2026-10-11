@@ -4,6 +4,7 @@ set -eu
 image=$1
 logs=${2:-}
 filesystem=${3:-fat}
+if [ "$#" -ge 3 ]; then shift 3; else set --; fi
 mountpoint=$(mktemp -d "${TMPDIR:-/tmp}/kaleidos-test-mount.XXXXXX")
 mounted=0
 cleanup() {
@@ -39,8 +40,12 @@ if [ "$mounted" -eq 0 ]; then
         debugfs -R "rdump / $mountpoint" "$image" >/dev/null
     fi
 fi
+if [ ! -r "$mountpoint/RUNTEST.SH" ]; then
+    echo 'Image has no RUNTEST.SH; rebuild it with ACTION=build before running.' >&2
+    exit 2
+fi
 if [ -n "$logs" ]; then
-    python3 "$mountpoint/RUNTEST.PY" --logs "$logs"
+    sh "$mountpoint/RUNTEST.SH" --logs "$logs" "$@"
 else
-    python3 "$mountpoint/RUNTEST.PY"
+    sh "$mountpoint/RUNTEST.SH" "$@"
 fi
