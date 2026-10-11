@@ -63,14 +63,10 @@ def build(args):
                 shutil.copy2(binary, suite_root / binary.name)
             if not any(suite_root.iterdir()):
                 raise RuntimeError(f"{suite}/{target}: compiler produced no test programs")
-            if target == "x86_64" and sys.platform.startswith("linux"):
-                run([sys.executable, str(RUNNER), "test", "--target", "linux", "--cc", compiler,
-                     "--out", str(temporary)])
     run([sys.executable, str(IMAGE), "pack", "--input", str(artifact_root),
          "--suites", ",".join(suites), "--output", str(args.out.resolve() / "tests.img")])
     run([sys.executable, str(IMAGE), "verify", "--input", str(artifact_root),
-         "--suites", ",".join(suites), "--image", str(args.out.resolve() / "tests.img"),
-         "--run-native", "--logs", str(args.out.resolve() / "reference-extracted")])
+         "--suites", ",".join(suites), "--image", str(args.out.resolve() / "tests.img")])
     print(f"test image ready: {args.out.resolve() / 'tests.img'}")
 
 

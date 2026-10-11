@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -144,6 +145,11 @@ def run(args):
             else:
                 # Separate working directory and closed stdin for each executable.
                 with tempfile.TemporaryDirectory(prefix="kaleidos-compat-") as work:
+                    if case["name"] == "posix/stat":
+                        # The upstream case compares stat(".") timestamps to time(0).
+                        # Start just after a whole-second boundary so clock rollover
+                        # between those calls cannot report a false future timestamp.
+                        time.sleep(1.1 - (time.time() % 1))
                     with (directory / "logs" / (binary.name + ".run.log")).open("wb") as log:
                         try:
                             process = subprocess.run([str(binary)], cwd=work, stdin=subprocess.DEVNULL,

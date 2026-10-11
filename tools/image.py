@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 
 def command(args):
@@ -107,8 +108,12 @@ def verify(args):
             command(["cmp", "--", str(original), str(extracted)])
             if args.run_native and isa == "x86_64" and _kind == "ELF":
                 extracted.chmod(0o755)
+                run_directory = destination / ("run-" + relative.replace("/", "_"))
+                run_directory.mkdir()
+                if relative.endswith("/posix_stat"):
+                    time.sleep(1.1 - (time.time() % 1))
                 try:
-                    process = subprocess.run([str(extracted)], cwd=destination,
+                    process = subprocess.run([str(extracted)], cwd=run_directory,
                                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                              stderr=subprocess.PIPE, timeout=30)
                 except (OSError, subprocess.TimeoutExpired) as error:
