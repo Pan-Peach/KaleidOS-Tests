@@ -18,10 +18,11 @@ the Linux host ISA and runs only compatible packaged tests. It writes
   applets (`cat`, `echo`, `cp`, `ls`, `rm`, `pwd`, `printf`). The same selected
   tests are checked during the build and run from the image.
 
-Open POSIX Testsuite and LTP are deferred. They are too large for this initial
-host workflow; their sources are not initialized and `SUITE=all` does not
-include them. BusyBox's full testsuite is also not claimed: only the selected
-applets above are included.
+LTP is deferred because its full kernel and system test collection is large.
+Open POSIX Testsuite is a separate suite inside the LTP source tree; it was
+deferred along with LTP in the first adapter pass and is not in `SUITE=all` yet.
+BusyBox's full testsuite is also not claimed: only the selected applets above
+are included.
 
 Picolibc reference configuration follows its upstream Meson options:
 `tests=true`, `native-tests=false`, and `tests-enable-posix-io=false`. The
@@ -38,22 +39,34 @@ From the KaleidOS repository root:
 git submodule update --init tests/kaleidos-tests
 git -C tests/kaleidos-tests submodule update --init third_party/libc-test third_party/picolibc third_party/busybox
 make test TARGET=linux SUITE=all
+make test TARGET=linux FS=ext4 SUITE=all
 ```
 
-The command builds `build/tests/test-linux-all/tests.img`, mounts it on the
-Linux host, and runs the packaged harness. It requires GCC, Python 3, Meson,
-Ninja, mtools, dosfstools, and permission to mount a loop image. To mount and
-inspect the disk manually:
+The command builds `build/tests/test-linux-<FS>-all/tests.img`, mounts it on
+Linux, and runs the packaged harness. If the environment does not expose loop
+devices, it extracts the verified image to a temporary directory and runs the
+same harness there. `FS=fat` is the default; `FS=ext4` creates a native ext4
+disk with full filenames. FAT requires mtools and dosfstools; ext4 requires
+e2fsprogs. Both need loop mount permission for direct mounting. To mount and
+inspect the default FAT disk manually:
 
 ```sh
 sudo mkdir -p /mnt/kaleidos-tests
-sudo mount -o "loop,exec,uid=$(id -u),gid=$(id -g),umask=022" build/tests/test-linux-all/tests.img /mnt/kaleidos-tests
+sudo mount -o "loop,exec,uid=$(id -u),gid=$(id -g),umask=022" build/tests/test-linux-fat-all/tests.img /mnt/kaleidos-tests
 cd /mnt/kaleidos-tests
 python3 RUNTEST.PY --logs "$HOME/kaleidos-test-logs"
 cat RESULTS.TXT
 cd -
 sudo umount /mnt/kaleidos-tests
 ```
+
+For the ext4 variant:
+
+```sh
+sudo mount -o loop,exec build/tests/test-linux-ext4-all/tests.img /mnt/kaleidos-tests
+```
+
+ext4 preserves the full artifact filenames and file modes.
 
 Select suites with `SUITE=libctest`, `SUITE=picolibc`, `SUITE=busybox`, or a
 comma-separated combination. Missing compilers or build tools are reported as
@@ -71,10 +84,10 @@ compatibility.
 
 ## Image layout and licenses
 
-The FAT image uses readable, collision-checked 8.3 filenames because KaleidOS
-FatFs disables long filenames. `TESTS.TXT` maps image paths to upstream test
-names, while `RUNLIST.TXT` contains the machine-readable harness plan. Build
-products stay under KaleidOS `build/` and do not modify upstream checkouts.
+FAT images use readable, collision-checked 8.3 filenames because KaleidOS
+FatFs disables long filenames. ext4 images keep full filenames for Linux host
+use. Both include `TESTS.TXT` mappings and the machine-readable `RUNLIST.TXT`.
+Build products stay under KaleidOS `build/` and do not modify upstream checkouts.
 
 Upstream copyright and license files remain in each source submodule. BusyBox
 binary redistribution must follow its GPL-2.0-or-later terms for the exact

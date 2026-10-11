@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build selected upstream test suites and assemble one FAT disk."""
+"""Build selected upstream test suites and assemble one disk image."""
 
 import argparse
 import json
@@ -240,14 +240,18 @@ def build(args):
     suites = args.suite.split(",") if args.suite != "all" else ["libctest", "picolibc", "busybox"]
     if not suites or len(set(suites)) != len(suites):
         raise RuntimeError("SUITE must be a non-empty, duplicate-free list")
-    if set(suites) & {"posixtst", "openposix", "ltp"}:
-        raise RuntimeError("Open POSIX Testsuite and LTP are deferred from the initial host workflow")
+    if "ltp" in suites:
+        raise RuntimeError("the full LTP suite is deferred from the initial host workflow")
+    if set(suites) & {"posixtst", "openposix"}:
+        raise RuntimeError("Open POSIX has its own upstream suite under LTP; its adapter is not implemented yet")
     unknown = sorted(set(suites) - {"libctest", "picolibc", "busybox"})
     if unknown:
         raise RuntimeError("unknown suites: " + ", ".join(unknown))
     targets = args.targets.split(",")
     if not targets or len(set(targets)) != len(targets):
         raise RuntimeError("TARGETS must be a comma-separated set of ISA names")
+    if args.fs not in ("fat", "ext4"):
+        raise RuntimeError("FS must be fat or ext4")
     artifact_root = output_dir / "artifacts"
     shutil.rmtree(artifact_root, ignore_errors=True)
     for suite in suites:
@@ -259,9 +263,11 @@ def build(args):
             else:
                 build_busybox(target, output_dir, artifact_root, args)
     run([sys.executable, str(IMAGE), "pack", "--input", str(artifact_root),
-         "--suites", ",".join(suites), "--output", str(output_dir / "tests.img")])
+         "--suites", ",".join(suites), "--fs", args.fs,
+         "--output", str(output_dir / "tests.img")])
     run([sys.executable, str(IMAGE), "verify", "--input", str(artifact_root),
-         "--suites", ",".join(suites), "--image", str(output_dir / "tests.img")])
+         "--suites", ",".join(suites), "--fs", args.fs,
+         "--image", str(output_dir / "tests.img")])
     print(f"test image ready: {output_dir / 'tests.img'}")
 
 
@@ -269,6 +275,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", default="all", help="all or comma-separated suite names")
     parser.add_argument("--targets", default="x86_64", help="comma-separated ISA names")
+    parser.add_argument("--fs", default="fat", help="disk filesystem: fat or ext4")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--x86-64-cc", dest="x86_64_cc", default="gcc")
     parser.add_argument("--rv64-cc", default="riscv64-linux-gnu-gcc")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create and verify the shared Suite/ISA FAT test disk."""
+"""Create and verify the shared Suite/ISA FAT or ext4 test disk."""
 
 import argparse
 import json
@@ -20,7 +20,7 @@ def command(args):
         raise RuntimeError(error.output.strip()) from error
 
 
-def entries(root, suites):
+def entries(root, suites, filesystem="fat"):
     result = []
     for suite in suites:
         suite_root = root / suite
@@ -36,6 +36,10 @@ def entries(root, suites):
                 source_relative = path.relative_to(root).as_posix()
                 header = path.read_bytes()[:4]
                 kind = "ELF" if header == b"\x7fELF" else "PE" if header[:2] == b"MZ" else "DATA"
+                if filesystem == "ext4":
+                    image_relative = f"{isa_root.parent.name}/{isa_root.name}/{path.name}"
+                    result.append((path, source_relative, image_relative, kind))
+                    continue
                 extension = {"ELF": "ELF", "PE": "EXE", "DATA": "DAT"}[kind]
                 stem = path.stem.upper()
                 for prefix in ("COMPILER_", "LIBC_", "POSIX_"):
@@ -59,7 +63,9 @@ def entries(root, suites):
 
 
 def pack(args):
-    selected = entries(args.input.resolve(), args.suites.split(","))
+    if args.fs not in ("fat", "ext4"):
+        raise RuntimeError("FS must be fat or ext4")
+    selected = entries(args.input.resolve(), args.suites.split(","), args.fs)
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.unlink(missing_ok=True)
@@ -69,21 +75,9 @@ def pack(args):
         reserve = max(4 * 1024 * 1024, payload_bytes // 8)
         image_bytes = max(64 * 1024 * 1024, payload_bytes + reserve + 32 * 1024 * 1024)
         image_bytes = ((image_bytes + 16 * 1024 * 1024 - 1) // (16 * 1024 * 1024)) * 16 * 1024 * 1024
-        image.write_bytes(bytes(image_bytes))
-        command(["mkfs.vfat", "-F", "32", "-n", "KALEIDOST", str(image)])
-        directories = sorted({str(Path(image_relative).parent)
-                              for _source, _source_relative, image_relative, _kind in selected},
-                            key=lambda item: (item.count("/"), item))
-        created = set()
-        for directory in directories:
-            parts = Path(directory).parts
-            for index in range(1, len(parts) + 1):
-                parent = "/".join(parts[:index])
-                if parent not in created:
-                    command(["mmd", "-i", str(image), f"::/{parent}"])
-                    created.add(parent)
-        for source, _source_relative, image_relative, _kind in selected:
-            command(["mcopy", "-o", "-i", str(image), str(source), f"::/{image_relative}"])
+        image.touch()
+        with image.open("r+b") as disk:
+            disk.truncate(image_bytes)
         image_paths = {source_relative: image_relative
                        for _source, source_relative, image_relative, _kind in selected}
         runlist = []
@@ -110,10 +104,8 @@ def pack(args):
         harness = Path(__file__).with_name("testharness.py")
         if not harness.is_file():
             raise RuntimeError("tools/testharness.py is missing")
-        command(["mcopy", "-o", "-i", str(image), str(harness), "::/RUNTEST.PY"])
-        command(["mcopy", "-o", "-i", str(image), str(runlist_file), "::/RUNLIST.TXT"])
-        lines = ["KaleidOS unified test disk; run python3 /RUNTEST.PY on Linux.",
-                 "image path (8.3) | format and ABI | original test name"]
+        lines = [f"KaleidOS unified {args.fs} test disk; run python3 /RUNTEST.PY on Linux.",
+                 "image path | format and ABI | original test name"]
         for source, source_relative, image_relative, kind in selected:
             _suite, isa, _name = image_relative.split("/", 2)
             machine_file = source.parent / ".machine"
@@ -127,9 +119,39 @@ def pack(args):
             lines.append(f"{image_relative} | {kind} {environment} | source {source_relative}")
         tests_file = Path(temporary) / "TESTS.TXT"
         tests_file.write_text("\r\n".join(lines) + "\r\n", encoding="ascii")
-        command(["mcopy", "-o", "-i", str(image), str(tests_file), "::/TESTS.TXT"])
+        if args.fs == "fat":
+            command(["mkfs.vfat", "-F", "32", "-n", "KALEIDOST", str(image)])
+            directories = sorted({str(Path(image_relative).parent)
+                                  for _source, _source_relative, image_relative, _kind in selected},
+                                key=lambda item: (item.count("/"), item))
+            created = set()
+            for directory in directories:
+                parts = Path(directory).parts
+                for index in range(1, len(parts) + 1):
+                    parent = "/".join(parts[:index])
+                    if parent not in created:
+                        command(["mmd", "-i", str(image), f"::/{parent}"])
+                        created.add(parent)
+            for source, _source_relative, image_relative, _kind in selected:
+                command(["mcopy", "-o", "-i", str(image), str(source), f"::/{image_relative}"])
+            for source, destination in ((harness, "RUNTEST.PY"),
+                                        (runlist_file, "RUNLIST.TXT"),
+                                        (tests_file, "TESTS.TXT")):
+                command(["mcopy", "-o", "-i", str(image), str(source), f"::/{destination}"])
+        else:
+            stage = Path(temporary) / "ext4-root"
+            stage.mkdir()
+            for source, _source_relative, image_relative, _kind in selected:
+                destination = stage / image_relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+            shutil.copy2(harness, stage / "RUNTEST.PY")
+            shutil.copy2(runlist_file, stage / "RUNLIST.TXT")
+            shutil.copy2(tests_file, stage / "TESTS.TXT")
+            command(["mke2fs", "-q", "-F", "-t", "ext4", "-L", "KALEIDOST",
+                     "-d", str(stage), str(image)])
         shutil.copyfile(image, output)
-    print(f"image: {output} ({output.stat().st_size} bytes, {len(selected)} artifacts)")
+    print(f"image: {output} ({args.fs}, {output.stat().st_size} bytes, {len(selected)} artifacts)")
     return 0
 
 
@@ -137,7 +159,11 @@ def verify(args):
     image = args.image.resolve()
     if not image.is_file():
         raise RuntimeError(f"image not found: {image}")
-    found = entries(args.input.resolve(), args.suites.split(","))
+    found = entries(args.input.resolve(), args.suites.split(","), args.fs)
+    if args.fs == "ext4":
+        return verify_ext4(args, image, found)
+    if args.fs != "fat":
+        raise RuntimeError("FS must be fat or ext4")
     listing = command(["mdir", "-i", str(image), "::/"])
     for required in (r"TESTS\s+TXT", r"RUNLIST\s+TXT", r"RUNTEST\s+PY"):
         if not re.search(required, listing):
@@ -242,6 +268,50 @@ def verify(args):
     return 0
 
 
+def verify_ext4(args, image, found):
+    with tempfile.TemporaryDirectory(prefix="kaleidos-ext4-verify-") as temporary:
+        destination = Path(temporary)
+        command(["debugfs", "-R", f"rdump / {destination}", str(image)])
+        expected_files = {image_relative for _source, _source_relative, image_relative, _kind in found}
+        expected_files.update({"TESTS.TXT", "RUNLIST.TXT", "RUNTEST.PY"})
+        actual_files = {path.relative_to(destination).as_posix()
+                        for path in destination.rglob("*") if path.is_file()}
+        if actual_files != expected_files:
+            raise RuntimeError(f"ext4 file list differs: expected {sorted(expected_files)}, found {sorted(actual_files)}")
+        for source, source_relative, image_relative, _kind in found:
+            extracted = destination / image_relative
+            original = args.input.resolve() / source_relative
+            if extracted.stat().st_size != original.stat().st_size:
+                raise RuntimeError(f"size changed in ext4 image: {image_relative}")
+            command(["cmp", "--", str(original), str(extracted)])
+            if args.run_native and image_relative.startswith("libctest/x86_64/") and _kind == "ELF":
+                run_directory = destination / ("run-" + source_relative.replace("/", "_"))
+                run_directory.mkdir()
+                if source_relative.endswith("/posix_stat"):
+                    time.sleep(1.1 - (time.time() % 1))
+                process = subprocess.run([str(extracted)], cwd=run_directory,
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, timeout=30)
+                if process.returncode:
+                    raise RuntimeError(f"extracted Linux reference exited {process.returncode}: {source_relative}")
+        declared = (destination / "TESTS.TXT").read_text(encoding="ascii")
+        for _source, source_relative, image_relative, _kind in found:
+            if image_relative not in declared or f"source {source_relative}" not in declared:
+                raise RuntimeError(f"missing manifest mapping: {source_relative}")
+        harness = Path(__file__).with_name("testharness.py")
+        if harness.read_bytes() != (destination / "RUNTEST.PY").read_bytes():
+            raise RuntimeError("RUNTEST.PY differs from the source harness")
+        runlist = json.loads((destination / "RUNLIST.TXT").read_text(encoding="utf-8"))
+        for row in runlist:
+            paths = ([row.get("image")] if row.get("image") else [])
+            paths.extend(row.get(key) for key in ("binary", "config", "tests", "echo"))
+            for path in paths:
+                if path and path not in expected_files:
+                    raise RuntimeError(f"RUNLIST.TXT references a missing image path: {path}")
+    print(f"ext4 verified: {image} ({len(found)} artifacts readable and identical)")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="action", required=True)
@@ -249,6 +319,7 @@ def main():
         sub = subparsers.add_parser(action)
         sub.add_argument("--input", type=Path, required=True, help="suite/isa artifact root")
         sub.add_argument("--suites", required=True, help="comma-separated suite names")
+        sub.add_argument("--fs", default="fat", help="disk filesystem: fat or ext4")
         if action == "pack":
             sub.add_argument("--output", type=Path, required=True)
             sub.set_defaults(run=pack)

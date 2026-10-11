@@ -3,19 +3,41 @@ set -eu
 
 image=$1
 logs=${2:-}
+filesystem=${3:-fat}
 mountpoint=$(mktemp -d "${TMPDIR:-/tmp}/kaleidos-test-mount.XXXXXX")
+mounted=0
 cleanup() {
-    if mountpoint -q "$mountpoint"; then
+    if [ "$mounted" -eq 1 ]; then
         if [ "$(id -u)" -eq 0 ]; then umount "$mountpoint"; else sudo umount "$mountpoint"; fi
     fi
-    rmdir "$mountpoint"
+    rm -rf "$mountpoint"
 }
 trap cleanup EXIT HUP INT TERM
 
-if [ "$(id -u)" -eq 0 ]; then
-    mount -o "loop,exec,uid=$(id -u),gid=$(id -g),umask=022" "$image" "$mountpoint"
+if [ "$filesystem" = fat ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+        mount -t vfat -o "loop,exec,uid=$(id -u),gid=$(id -g),umask=022" "$image" "$mountpoint" && mounted=1 || true
+    else
+        sudo mount -t vfat -o "loop,exec,uid=$(id -u),gid=$(id -g),umask=022" "$image" "$mountpoint" && mounted=1 || true
+    fi
+elif [ "$filesystem" = ext4 ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+        mount -t ext4 -o loop,exec "$image" "$mountpoint" && mounted=1 || true
+    else
+        sudo mount -t ext4 -o loop,exec "$image" "$mountpoint" && mounted=1 || true
+    fi
 else
-    sudo mount -o "loop,exec,uid=$(id -u),gid=$(id -g),umask=022" "$image" "$mountpoint"
+    echo "unsupported filesystem '$filesystem'; use fat or ext4" >&2
+    exit 2
+fi
+
+if [ "$mounted" -eq 0 ]; then
+    echo "Loop mount unavailable; extracting the $filesystem image to a temporary directory." >&2
+    if [ "$filesystem" = fat ]; then
+        mcopy -s -i "$image" '::/*' "$mountpoint"
+    else
+        debugfs -R "rdump / $mountpoint" "$image" >/dev/null
+    fi
 fi
 if [ -n "$logs" ]; then
     python3 "$mountpoint/RUNTEST.PY" --logs "$logs"
