@@ -1,83 +1,82 @@
 # KaleidOS-Tests
 
-This repository holds upstream user-space test suites and builds their selected
-programs into one FAT disk image. It does not contain a guest runner or make
-KaleidOS claim a PASS from a Linux reference run.
+This repository pins upstream user-space suites and builds them into one FAT
+image organized by suite and ISA. The image includes `RUNTEST.PY`, which detects
+the Linux host ISA and runs only compatible packaged tests. It writes
+`RESULTS.TXT` to the mounted image when the filesystem is writable; pass
+`--logs DIR` to save a host-side copy and per-test output.
 
-## Current state
+## Included suites
 
-`libctest` is migrated from KaleidOS at the original upstream revision pinned
-by the `third_party/libc-test` gitlink. Its selected tests, diagnostics, and native
-Linux/Windows build runner are retained. The first image builder supports Linux
-ELF builds for `x86_64`, `rv64`, `rv32`, `aarch64`, and `loongarch64`; cross builds
-require a Linux-targeting compiler for the requested ISA. A Linux x86_64 image
-build can be checked with the native reference runner.
+- `libctest`: selected upstream libc-test cases, built for Linux. Each source
+  test and its build status is listed in the run manifest.
+- `picolibc`: upstream Meson test programs linked with Picolibc's Linux libc
+  and Linux OS glue. The current adapter targets x86_64. It packages only
+  tests Meson reported as passing in the build environment; the host harness
+  executes them again from the image.
+- `busybox`: upstream BusyBox binary and a curated set of upstream testsuite
+  applets (`cat`, `echo`, `cp`, `ls`, `rm`, `pwd`, `printf`). The same selected
+  tests are checked during the build and run from the image.
 
-Picolibc, LTP (the Open POSIX Testsuite source), and BusyBox are pinned source
-submodules. Their build/test adapters are not yet implemented, so each fails
-with an explicit message when selected. LTP is optional and is not initialized
-by recursive submodule updates. `SUITE=all` therefore fails until each selected
-suite is implemented; nothing is skipped.
+Open POSIX Testsuite and LTP are deferred. They are too large for this initial
+host workflow; their sources are not initialized and `SUITE=all` does not
+include them. BusyBox's full testsuite is also not claimed: only the selected
+applets above are included.
 
-The remaining suite adapters must follow their upstream build contracts:
+Picolibc reference configuration follows its upstream Meson options:
+`tests=true`, `native-tests=false`, and `tests-enable-posix-io=false`. The
+`native-tests=true` option tests the host libc and is not used. See the
+[upstream build options](https://github.com/picolibc/picolibc/blob/main/doc/build.md).
+BusyBox uses the upstream `testsuite/runtest` selector interface documented in
+its [testsuite README](https://git.busybox.net/busybox/plain/testsuite/README).
 
-- Picolibc uses Meson options `tests=true` and `tests-enable-posix-io=false` for
-  the focused suite; `native-tests=true` explicitly tests the host libc and must
-  not be used to claim Picolibc coverage. See the [upstream build options](https://github.com/picolibc/picolibc/blob/main/doc/build.md).
-- LTP's Open POSIX Testsuite has its own configure and generated Makefiles. The
-  upstream quick start uses `--with-open-posix-testsuite` and
-  `make generate-makefiles` before selecting tests. See [LTP's quick start](https://github.com/linux-test-project/ltp/blob/master/doc/users/quick_start.rst).
-- BusyBox `testsuite/README` runs the upstream `./runtest` shell harness and
-  accepts applet names as selectors; those shell fragments and test data are
-  not standalone ELF tests. See the [pinned upstream README](https://git.busybox.net/busybox/plain/testsuite/README).
+## Build and run on Linux
 
-## Build and verify
-
-From KaleidOS, initialize this repository and the libc-test source used by the
-current builder, then run:
+From the KaleidOS repository root:
 
 ```sh
 git submodule update --init tests/kaleidos-tests
-git -C tests/kaleidos-tests submodule update --init third_party/libc-test
+git -C tests/kaleidos-tests submodule update --init third_party/libc-test third_party/picolibc third_party/busybox
+make test TARGET=linux SUITE=all
 ```
 
-To explicitly fetch the optional LTP source, override its no-update default:
+The command builds `build/tests/test-linux-all/tests.img`, mounts it on the
+Linux host, and runs the packaged harness. It requires GCC, Python 3, Meson,
+Ninja, mtools, dosfstools, and permission to mount a loop image. To mount and
+inspect the disk manually:
 
 ```sh
-git -C tests/kaleidos-tests -c submodule.third_party/ltp.update=checkout submodule update --init third_party/ltp
+sudo mkdir -p /mnt/kaleidos-tests
+sudo mount -o "loop,exec,uid=$(id -u),gid=$(id -g),umask=022" build/tests/test-linux-all/tests.img /mnt/kaleidos-tests
+cd /mnt/kaleidos-tests
+python3 RUNTEST.PY --logs "$HOME/kaleidos-test-logs"
+cat RESULTS.TXT
+cd -
+sudo umount /mnt/kaleidos-tests
 ```
 
-Then build and verify:
+Select suites with `SUITE=libctest`, `SUITE=picolibc`, `SUITE=busybox`, or a
+comma-separated combination. Missing compilers or build tools are reported as
+errors. The run harness reports incompatible ISAs as `SKIP` and test failures
+as `FAIL`; a skip is never counted as a pass.
 
-```sh
-make test-image ARCH=rv64 SUITE=libctest
-make test-image TARGETS=rv64,x86_64 SUITE=libctest
-make test-image-verify ARCH=rv64 SUITE=libctest
-make test-reference-linux SUITE=libctest
-```
+## KaleidOS image
 
-For a host-only image, use `TARGETS=x86_64`. Build products stay in KaleidOS'
-`build/` tree. The image has `suite/isa/` directories and a short `TESTS.TXT`
-index. KaleidOS FatFs disables long filenames, so the image uses readable,
-collision-checked 8.3 names. `TESTS.TXT` maps each image path to the original
-test name.
+`make test TARGET=kaleid ARCH=rv64 SUITE=libctest` builds an ISA-specific FAT
+image and boots it as KaleidOS's FAT root disk. The current guest does not
+provide Python or enough POSIX/ELF support to run these upstream suites
+automatically. Guest execution remains manual and limited by the capabilities
+listed in KaleidOS `STATUS.md`; Linux host results do not establish KaleidOS
+compatibility.
 
-Required image tools are `mkfs.vfat`, `mmd`, `mcopy`, `mdir`, and `cmp`.
-Compilers must match their requested ISA and Linux ABI. A missing compiler is a
-build error.
+## Image layout and licenses
 
-## QEMU
-
-`make qemu-test-image ARCH=rv64 SUITE=libctest` uses `tests.img` as the boot
-FAT root disk. KaleidOS init mounts the first discovered block device at `/fat`;
-the existing init path does not mount a second data disk. Use the monitor's
-`cat /fat/TESTS.TXT` to inspect the image. Executing a program still depends on
-the guest ISA, executable ABI, and implemented syscalls.
-
-## Licenses
+The FAT image uses readable, collision-checked 8.3 filenames because KaleidOS
+FatFs disables long filenames. `TESTS.TXT` maps image paths to upstream test
+names, while `RUNLIST.TXT` contains the machine-readable harness plan. Build
+products stay under KaleidOS `build/` and do not modify upstream checkouts.
 
 Upstream copyright and license files remain in each source submodule. BusyBox
-binary redistribution must follow its GPL-2.0-or-later terms, including the
-corresponding source-offer and license obligations for the exact configured
-build. The BusyBox testsuite may contain separately licensed test material;
-its notices must be retained when that suite is added.
+binary redistribution must follow its GPL-2.0-or-later terms for the exact
+configuration. The selected BusyBox testsuite files retain their upstream
+notices in the packaged archive.

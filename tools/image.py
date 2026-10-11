@@ -2,6 +2,7 @@
 """Create and verify the shared Suite/ISA FAT test disk."""
 
 import argparse
+import json
 from pathlib import Path
 import re
 import shutil
@@ -64,7 +65,11 @@ def pack(args):
     output.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="kaleidos-test-image-") as temporary:
         image = Path(temporary) / "tests.img"
-        image.write_bytes(bytes(64 * 1024 * 1024))
+        payload_bytes = sum(source.stat().st_size for source, *_rest in selected)
+        reserve = max(4 * 1024 * 1024, payload_bytes // 8)
+        image_bytes = max(64 * 1024 * 1024, payload_bytes + reserve + 32 * 1024 * 1024)
+        image_bytes = ((image_bytes + 16 * 1024 * 1024 - 1) // (16 * 1024 * 1024)) * 16 * 1024 * 1024
+        image.write_bytes(bytes(image_bytes))
         command(["mkfs.vfat", "-F", "32", "-n", "KALEIDOST", str(image)])
         directories = sorted({str(Path(image_relative).parent)
                               for _source, _source_relative, image_relative, _kind in selected},
@@ -79,7 +84,35 @@ def pack(args):
                     created.add(parent)
         for source, _source_relative, image_relative, _kind in selected:
             command(["mcopy", "-o", "-i", str(image), str(source), f"::/{image_relative}"])
-        lines = ["KaleidOS test image; binaries are manually run by ISA and execution support.",
+        image_paths = {source_relative: image_relative
+                       for _source, source_relative, image_relative, _kind in selected}
+        runlist = []
+        artifact_root = args.input.resolve()
+        for suite in args.suites.split(","):
+            for isa_root in sorted(path for path in (artifact_root / suite).iterdir() if path.is_dir()):
+                sidecar = isa_root / ".runlist.json"
+                if not sidecar.is_file():
+                    continue
+                data = json.loads(sidecar.read_text(encoding="utf-8"))
+                if suite == "busybox":
+                    runlist.append({"suite": "busybox", "isa": isa_root.name,
+                                    "applets": data["applets"]})
+                    row = runlist[-1]
+                    for key in ("binary", "config", "tests", "echo"):
+                        row[key] = image_paths[data[key]]
+                else:
+                    for row in data:
+                        relative = row.get("source")
+                        runlist.append({**row, "suite": suite, "isa": isa_root.name,
+                                        "image": image_paths.get(relative)})
+        runlist_file = Path(temporary) / "RUNLIST.TXT"
+        runlist_file.write_text(json.dumps(runlist, indent=2) + "\r\n", encoding="utf-8")
+        harness = Path(__file__).with_name("testharness.py")
+        if not harness.is_file():
+            raise RuntimeError("tools/testharness.py is missing")
+        command(["mcopy", "-o", "-i", str(image), str(harness), "::/RUNTEST.PY"])
+        command(["mcopy", "-o", "-i", str(image), str(runlist_file), "::/RUNLIST.TXT"])
+        lines = ["KaleidOS unified test disk; run python3 /RUNTEST.PY on Linux.",
                  "image path (8.3) | format and ABI | original test name"]
         for source, source_relative, image_relative, kind in selected:
             _suite, isa, _name = image_relative.split("/", 2)
@@ -106,8 +139,9 @@ def verify(args):
         raise RuntimeError(f"image not found: {image}")
     found = entries(args.input.resolve(), args.suites.split(","))
     listing = command(["mdir", "-i", str(image), "::/"])
-    if not re.search(r"TESTS\s+TXT", listing):
-        raise RuntimeError("TESTS.TXT is missing from FAT root")
+    for required in (r"TESTS\s+TXT", r"RUNLIST\s+TXT", r"RUNTEST\s+PY"):
+        if not re.search(required, listing):
+            raise RuntimeError(f"FAT root file is missing: {required}")
     recursive = command(["mdir", "-s", "-/", "-i", str(image), "::/"])
     current_directory = ""
     actual_files = set()
@@ -124,9 +158,9 @@ def verify(args):
             name = f"{file_entry.group(1)}.{file_entry.group(2)}"
             actual_files.add(f"{current_directory}/{name}" if current_directory else name)
     expected_files = {image_relative for _source, _source_relative, image_relative, _kind in found}
-    expected_files.add("TESTS.TXT")
+    expected_files.update({"TESTS.TXT", "RUNLIST.TXT", "RUNTEST.PY"})
     expected_directories = {"/".join(parts) for suite, isa, _name in
-                            (relative.split("/", 2) for relative in expected_files if relative != "TESTS.TXT")
+                            (relative.split("/", 2) for relative in expected_files if "/" in relative)
                             for parts in ((suite,), (suite, isa))}
     if actual_files != expected_files:
         raise RuntimeError(f"FAT file list differs: expected {sorted(expected_files)}, found {sorted(actual_files)}")
@@ -185,6 +219,20 @@ def verify(args):
         for _source, source_relative, image_relative, _kind in found:
             if image_relative not in declared or f"source {source_relative}" not in declared:
                 raise RuntimeError(f"missing manifest mapping: {source_relative}")
+        for root_file in ("RUNLIST.TXT", "RUNTEST.PY"):
+            extracted_root = destination / root_file
+            command(["mcopy", "-i", str(image), f"::/{root_file}", str(extracted_root)])
+            source = Path(__file__).with_name("testharness.py") if root_file == "RUNTEST.PY" else None
+            if source and source.read_bytes() != extracted_root.read_bytes():
+                raise RuntimeError("RUNTEST.PY differs from the source harness")
+            if root_file == "RUNLIST.TXT":
+                runlist = json.loads(extracted_root.read_text(encoding="utf-8"))
+                for row in runlist:
+                    paths = ([row.get("image")] if row.get("image") else [])
+                    paths.extend(row.get(key) for key in ("binary", "config", "tests", "echo"))
+                    for path in paths:
+                        if path and path not in expected_files:
+                            raise RuntimeError(f"RUNLIST.TXT references a missing image path: {path}")
         if reference_rows and log_root:
             report = ["path\tstatus\texit_status"]
             report.extend(f"{path}\t{status}\t{code}" for path, status, code in reference_rows)
