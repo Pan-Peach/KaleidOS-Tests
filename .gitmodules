@@ -1,3 +1,13 @@
 [submodule "third_party/libc-test"]
 	path = third_party/libc-test
 	url = https://github.com/kraj/libc-test.git
+[submodule "third_party/picolibc"]
+	path = third_party/picolibc
+	url = https://github.com/picolibc/picolibc.git
+[submodule "third_party/ltp"]
+	path = third_party/ltp
+	url = https://github.com/linux-test-project/ltp.git
+	update = none
+[submodule "third_party/busybox"]
+	path = third_party/busybox
+	url = https://git.busybox.net/busybox

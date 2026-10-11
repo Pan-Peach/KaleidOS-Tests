@@ -13,14 +13,23 @@ ELF builds for `x86_64`, `rv64`, `rv32`, `aarch64`, and `loongarch64`; cross bui
 require a Linux-targeting compiler for the requested ISA. A Linux x86_64 image
 build can be checked with the native reference runner.
 
-Picolibc, Open POSIX Testsuite, and BusyBox are reserved suite names but are not
-yet integrated. They fail with an explicit message when selected. `SUITE=all`
-therefore fails until each selected suite is implemented; nothing is skipped.
+Picolibc, LTP (the Open POSIX Testsuite source), and BusyBox are pinned source
+submodules. Their build/test adapters are not yet implemented, so each fails
+with an explicit message when selected. LTP is optional and is not initialized
+by recursive submodule updates. `SUITE=all` therefore fails until each selected
+suite is implemented; nothing is skipped.
 
 ## Build and verify
 
-From KaleidOS, initialize this repository and its pinned libc-test source, then
-run:
+From KaleidOS, initialize this repository and the libc-test source used by the
+current builder, then run:
+
+```sh
+git submodule update --init tests/kaleidos-tests
+git -C tests/kaleidos-tests submodule update --init third_party/libc-test
+```
+
+Then build and verify:
 
 ```sh
 make test-image ARCH=rv64 SUITE=libctest

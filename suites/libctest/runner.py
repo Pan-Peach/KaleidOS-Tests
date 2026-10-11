@@ -65,7 +65,7 @@ def build(args):
     for filename in ("build.json", "results.json", "results.tsv"):
         (directory / filename).unlink(missing_ok=True)
     if not (UPSTREAM / "COPYRIGHT").is_file():
-        raise ValueError("run git submodule update --init --recursive first")
+        raise ValueError("initialize third_party/libc-test in KaleidOS-Tests first")
     compiler = args.cc or ("gcc" if sys.platform == "win32" else
                           "x86_64-w64-mingw32-gcc" if args.target == "windows" else "cc")
     machine = subprocess.check_output([compiler, "-dumpmachine"], text=True).strip()

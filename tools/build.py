@@ -41,9 +41,9 @@ def build(args):
     unknown = sorted(set(suites) - {"libctest"})
     if unknown:
         reasons = {
-            "picolibc": "no pinned Picolibc source or Meson test adapter",
-            "posixtst": "optional LTP Open POSIX submodule and cross-build selection are not configured",
-            "busybox": "no pinned BusyBox source or Linux testsuite adapter",
+            "picolibc": "source is pinned, but the Meson testsuite adapter is not implemented",
+            "posixtst": "LTP source is pinned optional; Open POSIX test selection/build adapter is not implemented",
+            "busybox": "source is pinned, but the Linux build/testsuite adapter is not implemented",
         }
         detail = "; ".join(f"{suite}: {reasons.get(suite, 'unknown suite')}" for suite in unknown)
         raise RuntimeError("suite not integrated: " + detail)
