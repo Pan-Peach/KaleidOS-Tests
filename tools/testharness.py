@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import platform
+import resource
+import shlex
 import shutil
 import subprocess
 import sys
@@ -29,6 +31,29 @@ def run_one(path, args=(), env=None, timeout=30, cwd=None):
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              timeout=max(1, int(timeout)))
     return process.returncode, process.stdout.decode("utf-8", errors="replace")
+
+
+def effective_capability(number):
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("CapEff:"):
+                return bool(int(line.split()[1], 16) & (1 << number))
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def can_set_fifo_priority(priority):
+    cap_sys_nice = effective_capability(23)
+    if cap_sys_nice is True:
+        return True
+    try:
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_RTPRIO)
+    except (AttributeError, OSError, ValueError):
+        return None
+    if soft_limit == resource.RLIM_INFINITY or soft_limit >= priority:
+        return True
+    return False if cap_sys_nice is False else None
 
 
 def color_enabled(mode):
@@ -106,7 +131,7 @@ def main():
                         test_dir = work / "testsuite"
                         bindir = work / "bin"
                         bindir.mkdir()
-                        for key, target in (("binary", "busybox"), ("config", "bbconfig.data"),
+                        for key, target in (("binary", "busybox"), ("config", ".config"),
                                             ("echo", "echo-ne")):
                             shutil.copy2(root / item[key], bindir / target)
                         (bindir / "busybox").chmod(0o755)
@@ -136,8 +161,21 @@ def main():
                         cases = sorted(test_root.rglob("*.run-test"))
                         for case in cases:
                             name = "openposix/" + case.relative_to(test_root).with_suffix("").as_posix()
+                            relative = case.relative_to(test_root).as_posix()
+                            if (relative == "functional/timers/clocks/clocks_twopsetclock.run-test"
+                                    and effective_capability(25) is False):
+                                record(name, "SKIP", "requires CAP_SYS_TIME to set CLOCK_REALTIME")
+                                continue
+                            if (relative == "conformance/interfaces/pthread_rwlock_unlock/"
+                                        "pthread_rwlock_unlock_3-1.run-test"
+                                    and can_set_fifo_priority(
+                                        os.sched_get_priority_min(os.SCHED_FIFO) + 3) is False):
+                                record(name, "SKIP", "requires permission to use SCHED_FIFO priorities")
+                                continue
                             try:
-                                code, output = run_one(case, timeout=item.get("timeout", 60),
+                                args_file = case.with_suffix(".args")
+                                case_args = shlex.split(args_file.read_text()) if args_file.is_file() else []
+                                code, output = run_one(case, case_args, timeout=item.get("timeout", 60),
                                                        cwd=case.parent)
                                 status = {0: "PASS", 1: "FAIL", 2: "WARN",
                                           4: "SKIP", 5: "SKIP"}.get(code, "FAIL")
