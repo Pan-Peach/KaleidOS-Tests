@@ -233,18 +233,55 @@ def build_busybox(target, output_dir, artifact_root, args):
     }, indent=2) + "\n", encoding="utf-8")
 
 
+def build_openposix(target, output_dir, artifact_root, args):
+    if target != "x86_64":
+        raise RuntimeError("Open POSIX Linux reference tests currently target x86_64 only")
+    source = ROOT / "third_party" / "open_posix_testsuite" / "testcases" / "open_posix_testsuite"
+    if not (source / "Makefile").is_file():
+        raise RuntimeError("prepare third_party/open_posix_testsuite with tools/prepare-openposix.sh first")
+    build_dir = output_dir / "openposix-build" / target / "open_posix_testsuite"
+    shutil.rmtree(build_dir.parent, ignore_errors=True)
+    build_dir.parent.mkdir(parents=True)
+    shutil.copytree(source, build_dir, symlinks=True)
+    env = {**os.environ, "CC": args.x86_64_cc}
+    run(["make", "generate-makefiles"], cwd=build_dir, env=env,
+        output=output_dir / "openposix-generate.log")
+    run(["make", f"-j{args.jobs}"], cwd=build_dir, env=env,
+        output=output_dir / "openposix-build.log")
+    cases = sorted(build_dir.rglob("*.run-test"))
+    if not cases:
+        raise RuntimeError("Open POSIX build produced no .run-test cases")
+
+    suite_root = artifact_root / "openposix" / target
+    shutil.rmtree(suite_root, ignore_errors=True)
+    suite_root.mkdir(parents=True)
+    machine = subprocess.check_output([args.x86_64_cc, "-dumpmachine"], text=True).strip()
+    if isa_for(machine) != target:
+        raise RuntimeError(f"{args.x86_64_cc} targets {machine}, expected {target}")
+    (suite_root / ".machine").write_text(machine + "\n", encoding="ascii")
+    archive_path = suite_root / "openposix.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as archive:
+        archive.add(build_dir, arcname="open_posix_testsuite")
+    (suite_root / ".runlist.json").write_text(json.dumps([{
+        "source": f"openposix/{target}/{archive_path.name}",
+        "name": f"Open POSIX ({len(cases)} cases)",
+        "timeout": 60,
+    }], indent=2) + "\n", encoding="utf-8")
+
+
 def build(args):
     output_dir = args.out.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "tests.img").unlink(missing_ok=True)
-    suites = args.suite.split(",") if args.suite != "all" else ["libctest", "picolibc", "busybox"]
+    suites = args.suite.split(",") if args.suite != "all" else [
+        "libctest", "picolibc", "busybox"]
+    if args.suite == "all" and "x86_64" in args.targets.split(","):
+        suites.insert(2, "openposix")
     if not suites or len(set(suites)) != len(suites):
         raise RuntimeError("SUITE must be a non-empty, duplicate-free list")
     if "ltp" in suites:
-        raise RuntimeError("the full LTP suite is deferred from the initial host workflow")
-    if set(suites) & {"posixtst", "openposix"}:
-        raise RuntimeError("Open POSIX has its own upstream suite under LTP; its adapter is not implemented yet")
-    unknown = sorted(set(suites) - {"libctest", "picolibc", "busybox"})
+        raise RuntimeError("LTP is not a supported suite; select openposix instead")
+    unknown = sorted(set(suites) - {"libctest", "picolibc", "openposix", "busybox"})
     if unknown:
         raise RuntimeError("unknown suites: " + ", ".join(unknown))
     targets = args.targets.split(",")
@@ -260,6 +297,8 @@ def build(args):
                 build_libctest(target, artifact_root, args, output_dir)
             elif suite == "picolibc":
                 build_picolibc(target, output_dir, artifact_root, args)
+            elif suite == "openposix":
+                build_openposix(target, output_dir, artifact_root, args)
             else:
                 build_busybox(target, output_dir, artifact_root, args)
     run([sys.executable, str(IMAGE), "pack", "--input", str(artifact_root),

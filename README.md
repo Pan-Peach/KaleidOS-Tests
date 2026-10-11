@@ -14,15 +14,18 @@ the Linux host ISA and runs only compatible packaged tests. It writes
   and Linux OS glue. The current adapter targets x86_64. It packages only
   tests Meson reported as passing in the build environment; the host harness
   executes them again from the image.
+- `openposix`: the Open POSIX conformance, functional, and stress cases from
+  LTP's `testcases/open_posix_testsuite` subtree. The source checkout uses
+  blob filtering and sparse checkout so only that subtree is populated. The
+  adapter builds it for x86_64 Linux and runs each generated `.run-test` case.
 - `busybox`: upstream BusyBox binary and a curated set of upstream testsuite
   applets (`cat`, `echo`, `cp`, `ls`, `rm`, `pwd`, `printf`). The same selected
   tests are checked during the build and run from the image.
 
-LTP is deferred because its full kernel and system test collection is large.
-Open POSIX Testsuite is a separate suite inside the LTP source tree; it was
-deferred along with LTP in the first adapter pass and is not in `SUITE=all` yet.
-BusyBox's full testsuite is also not claimed: only the selected applets above
-are included.
+The full LTP kernel and system test collection remains deferred. Open POSIX is
+packaged as its own suite; LTP's other tests are neither built nor copied into
+the image. BusyBox's full testsuite is also not claimed: only the selected
+applets above are included.
 
 Picolibc reference configuration follows its upstream Meson options:
 `tests=true`, `native-tests=false`, and `tests-enable-posix-io=false`. The
@@ -38,6 +41,7 @@ From the KaleidOS repository root:
 ```sh
 git submodule update --init tests/kaleidos-tests
 git -C tests/kaleidos-tests submodule update --init third_party/libc-test third_party/picolibc third_party/busybox
+sh tests/kaleidos-tests/tools/prepare-openposix.sh
 make test TARGET=linux SUITE=all
 make test TARGET=linux FS=ext4 SUITE=all
 ```
@@ -68,10 +72,13 @@ sudo mount -o loop,exec build/tests/test-linux-ext4-all/tests.img /mnt/kaleidos-
 
 ext4 preserves the full artifact filenames and file modes.
 
-Select suites with `SUITE=libctest`, `SUITE=picolibc`, `SUITE=busybox`, or a
-comma-separated combination. Missing compilers or build tools are reported as
-errors. The run harness reports incompatible ISAs as `SKIP` and test failures
-as `FAIL`; a skip is never counted as a pass.
+Select suites with `SUITE=libctest`, `SUITE=picolibc`, `SUITE=openposix`,
+`SUITE=busybox`, or a comma-separated combination. Missing compilers or build
+tools are reported as errors. The run harness prints each suite between
+separators, colors PASS green, FAIL red, and WARN/SKIP yellow on interactive
+terminals, and reports incompatible ISAs as `SKIP`; a skip is never counted as
+a pass. Use `--color always` or `--color never` when running `RUNTEST.PY`
+directly to override terminal detection.
 
 ## KaleidOS image
 

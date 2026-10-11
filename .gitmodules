@@ -4,8 +4,8 @@
 [submodule "third_party/picolibc"]
 	path = third_party/picolibc
 	url = https://github.com/picolibc/picolibc.git
-[submodule "third_party/ltp"]
-	path = third_party/ltp
+[submodule "third_party/open_posix_testsuite"]
+	path = third_party/open_posix_testsuite
 	url = https://github.com/linux-test-project/ltp.git
 	update = none
 [submodule "third_party/busybox"]
