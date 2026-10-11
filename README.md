@@ -74,7 +74,8 @@ ext4 preserves the full artifact filenames and file modes.
 
 Select suites with `SUITE=libctest`, `SUITE=picolibc`, `SUITE=openposix`,
 `SUITE=busybox`, or a comma-separated combination. Missing compilers or build
-tools are reported as errors. The run harness prints each suite between
+tools are reported as errors; Open POSIX also requires Autoconf. The run
+harness prints each suite between
 separators, colors PASS green, FAIL red, and WARN/SKIP yellow on interactive
 terminals, and reports incompatible ISAs as `SKIP`; a skip is never counted as
 a pass. Use `--color always` or `--color never` when running `RUNTEST.PY`

@@ -244,6 +244,12 @@ def build_openposix(target, output_dir, artifact_root, args):
     build_dir.parent.mkdir(parents=True)
     shutil.copytree(source, build_dir, symlinks=True)
     env = {**os.environ, "CC": args.x86_64_cc}
+    if shutil.which("autoconf") is None:
+        raise RuntimeError("Open POSIX requires Autoconf (Debian/Ubuntu: apt install autoconf)")
+    run(["make", "autotools"], cwd=build_dir, env=env,
+        output=output_dir / "openposix-autotools.log")
+    run(["./configure", f"CC={args.x86_64_cc}"], cwd=build_dir, env=env,
+        output=output_dir / "openposix-configure.log")
     run(["make", "generate-makefiles"], cwd=build_dir, env=env,
         output=output_dir / "openposix-generate.log")
     run(["make", f"-j{args.jobs}"], cwd=build_dir, env=env,
