@@ -108,6 +108,30 @@ def verify(args):
     listing = command(["mdir", "-i", str(image), "::/"])
     if not re.search(r"TESTS\s+TXT", listing):
         raise RuntimeError("TESTS.TXT is missing from FAT root")
+    recursive = command(["mdir", "-s", "-/", "-i", str(image), "::/"])
+    current_directory = ""
+    actual_files = set()
+    actual_directories = set()
+    for line in recursive.splitlines():
+        directory = re.match(r"Directory for ::/?([^\s]*)", line)
+        if directory:
+            current_directory = directory.group(1).strip("/")
+            if current_directory:
+                actual_directories.add(current_directory)
+            continue
+        file_entry = re.match(r"([A-Z0-9_~]{1,8})\s+([A-Z0-9_~]{1,3})\s+\d+\s", line)
+        if file_entry:
+            name = f"{file_entry.group(1)}.{file_entry.group(2)}"
+            actual_files.add(f"{current_directory}/{name}" if current_directory else name)
+    expected_files = {image_relative for _source, _source_relative, image_relative, _kind in found}
+    expected_files.add("TESTS.TXT")
+    expected_directories = {"/".join(parts) for suite, isa, _name in
+                            (relative.split("/", 2) for relative in expected_files if relative != "TESTS.TXT")
+                            for parts in ((suite,), (suite, isa))}
+    if actual_files != expected_files:
+        raise RuntimeError(f"FAT file list differs: expected {sorted(expected_files)}, found {sorted(actual_files)}")
+    if actual_directories != expected_directories:
+        raise RuntimeError(f"FAT directories differ: expected {sorted(expected_directories)}, found {sorted(actual_directories)}")
     with tempfile.TemporaryDirectory(prefix="kaleidos-test-verify-") as temporary:
         destination = Path(temporary)
         reference_rows = []
