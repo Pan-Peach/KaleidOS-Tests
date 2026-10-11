@@ -77,9 +77,10 @@ Select suites with `SUITE=libctest`, `SUITE=picolibc`, `SUITE=openposix`,
 tools are reported as errors; Open POSIX also requires Autoconf. The run
 harness prints each suite between
 separators, colors PASS green, FAIL red, and WARN/SKIP yellow on interactive
-terminals, and reports incompatible ISAs as `SKIP`; a skip is never counted as
-a pass. Use `--color always` or `--color never` when running `RUNTEST.PY`
-directly to override terminal detection.
+terminals, prints each test's captured output beneath its result, and reports
+incompatible ISAs as `SKIP`; a skip is never counted as a pass. Use
+`--color always` or `--color never` when running `RUNTEST.PY` directly to
+override terminal detection.
 
 ## KaleidOS image
 

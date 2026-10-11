@@ -67,6 +67,9 @@ def main():
         rows.append(row)
         label = paint(status.ljust(7), status)
         print(f"{label} {name}" + (f" ({detail})" if detail else ""), flush=True)
+        if output:
+            for line in output.rstrip().splitlines():
+                print(f"        {line}", flush=True)
         if output_dir and output:
             safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
             (output_dir / f"{safe}.log").write_text(output, encoding="utf-8")
@@ -134,8 +137,7 @@ def main():
                         for case in cases:
                             name = "openposix/" + case.relative_to(test_root).with_suffix("").as_posix()
                             try:
-                                code, output = run_one(shutil.which("sh") or "/bin/sh",
-                                                       [str(case)], timeout=item.get("timeout", 60),
+                                code, output = run_one(case, timeout=item.get("timeout", 60),
                                                        cwd=case.parent)
                                 status = "PASS" if code == 0 else "WARN" if code == 2 else "FAIL"
                                 record(name, status, f"exit {code}", output)
