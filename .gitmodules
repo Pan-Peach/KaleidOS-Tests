@@ -1,0 +1,3 @@
+[submodule "third_party/libc-test"]
+	path = third_party/libc-test
+	url = https://github.com/kraj/libc-test.git
