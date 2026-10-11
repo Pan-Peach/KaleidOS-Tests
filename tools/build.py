@@ -23,6 +23,12 @@ def isa_for(machine):
         return "x86_64"
     if machine.startswith("riscv64-"):
         return "rv64"
+    if machine.startswith("riscv32-"):
+        return "rv32"
+    if machine.startswith("aarch64-"):
+        return "aarch64"
+    if machine.startswith("loongarch64-"):
+        return "loongarch64"
     raise RuntimeError(f"unsupported compiler machine for image classification: {machine}")
 
 
@@ -53,6 +59,10 @@ def build(args):
                 compiler = args.rv64_cc
             elif target == "rv32":
                 compiler = args.rv32_cc
+            elif target == "aarch64":
+                compiler = args.aarch64_cc
+            elif target == "loongarch64":
+                compiler = args.loongarch64_cc
             else:
                 raise RuntimeError(f"unsupported ISA target: {target}")
             temporary = output_dir / "compat" / target
@@ -87,6 +97,8 @@ def main():
     parser.add_argument("--x86-64-cc", dest="x86_64_cc", default="gcc")
     parser.add_argument("--rv64-cc", default="riscv64-linux-gnu-gcc")
     parser.add_argument("--rv32-cc", default="riscv32-linux-gnu-gcc")
+    parser.add_argument("--aarch64-cc", default="aarch64-linux-gnu-gcc")
+    parser.add_argument("--loongarch64-cc", default="loongarch64-linux-gnu-gcc")
     args = parser.parse_args()
     try:
         build(args)

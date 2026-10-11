@@ -9,8 +9,9 @@ KaleidOS claim a PASS from a Linux reference run.
 `libctest` is migrated from KaleidOS at the original upstream revision recorded
 in `third_party/libc-test.commit`. Its selected tests, diagnostics, and native
 Linux/Windows build runner are retained. The first image builder supports Linux
-ELF builds for `x86_64` and `rv64`; the latter requires a Linux-targeting RV64
-cross compiler. A Linux x86_64 image build also runs the native reference tests.
+ELF builds for `x86_64`, `rv64`, `rv32`, `aarch64`, and `loongarch64`; cross builds
+require a Linux-targeting compiler for the requested ISA. A Linux x86_64 image
+build can be checked with the native reference runner.
 
 Picolibc, Open POSIX Testsuite, and BusyBox are reserved suite names but are not
 yet integrated. They fail with an explicit message when selected. `SUITE=all`
