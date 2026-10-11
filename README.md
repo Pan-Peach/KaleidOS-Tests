@@ -30,8 +30,9 @@ make test-reference-linux SUITE=libctest
 
 For a host-only image, use `TARGETS=x86_64`. Build products stay in KaleidOS'
 `build/` tree. The image has `suite/isa/` directories and a short `TESTS.TXT`
-index. FAT long filenames preserve original test names; no executable names are
-renumbered.
+index. KaleidOS FatFs disables long filenames, so the image uses readable,
+collision-checked 8.3 names. `TESTS.TXT` maps each image path to the original
+test name.
 
 Required image tools are `mkfs.vfat`, `mmd`, `mcopy`, `mdir`, and `cmp`.
 Compilers must match their requested ISA and Linux ABI. A missing compiler is a

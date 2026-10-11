@@ -31,7 +31,13 @@ def build(args):
               ["libctest", "picolibc", "posixtst", "busybox"])
     unknown = sorted(set(suites) - {"libctest"})
     if unknown:
-        raise RuntimeError("suite source/build integration is not ready: " + ", ".join(unknown))
+        reasons = {
+            "picolibc": "no pinned Picolibc source or Meson test adapter",
+            "posixtst": "optional LTP Open POSIX submodule and cross-build selection are not configured",
+            "busybox": "no pinned BusyBox source or Linux testsuite adapter",
+        }
+        detail = "; ".join(f"{suite}: {reasons.get(suite, 'unknown suite')}" for suite in unknown)
+        raise RuntimeError("suite not integrated: " + detail)
     targets = args.targets.split(",")
     if not targets or len(set(targets)) != len(targets):
         raise RuntimeError("TARGETS must be a comma-separated set of ISA names")

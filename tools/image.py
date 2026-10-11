@@ -30,11 +30,28 @@ def entries(root, suites):
                            if path.is_file() and not path.name.startswith("."))
             if not files:
                 raise RuntimeError(f"empty artifact directory: {isa_root}")
+            used = set()
             for path in files:
-                relative = path.relative_to(root).as_posix()
+                source_relative = path.relative_to(root).as_posix()
                 header = path.read_bytes()[:4]
                 kind = "ELF" if header == b"\x7fELF" else "PE" if header[:2] == b"MZ" else "DATA"
-                result.append((path, relative, kind))
+                extension = {"ELF": "ELF", "PE": "EXE", "DATA": "DAT"}[kind]
+                stem = path.stem.upper()
+                for prefix in ("COMPILER_", "LIBC_", "POSIX_"):
+                    if stem.startswith(prefix):
+                        stem = stem[len(prefix):]
+                        break
+                stem = re.sub(r"[^A-Z0-9]", "", stem) or "TEST"
+                base = stem[:8]
+                candidate = f"{base}.{extension}"
+                suffix = 1
+                while candidate in used:
+                    tail = str(suffix)
+                    candidate = f"{base[:8-len(tail)]}{tail}.{extension}"
+                    suffix += 1
+                used.add(candidate)
+                image_relative = f"{isa_root.parent.name}/{isa_root.name}/{candidate}"
+                result.append((path, source_relative, image_relative, kind))
     if not result:
         raise RuntimeError("selected suites produced no files")
     return result
@@ -49,7 +66,8 @@ def pack(args):
         image = Path(temporary) / "tests.img"
         image.write_bytes(bytes(64 * 1024 * 1024))
         command(["mkfs.vfat", "-F", "32", "-n", "KALEIDOST", str(image)])
-        directories = sorted({str(Path(relative).parent) for _source, relative, _kind in selected},
+        directories = sorted({str(Path(image_relative).parent)
+                              for _source, _source_relative, image_relative, _kind in selected},
                             key=lambda item: (item.count("/"), item))
         created = set()
         for directory in directories:
@@ -59,21 +77,21 @@ def pack(args):
                 if parent not in created:
                     command(["mmd", "-i", str(image), f"::/{parent}"])
                     created.add(parent)
-        for source, relative, _kind in selected:
-            command(["mcopy", "-o", "-i", str(image), str(source), f"::/{relative}"])
+        for source, _source_relative, image_relative, _kind in selected:
+            command(["mcopy", "-o", "-i", str(image), str(source), f"::/{image_relative}"])
         lines = ["KaleidOS test image; binaries are manually run by ISA and execution support.",
-                 "suite/isa/path | format | environment"]
-        for source, relative, kind in selected:
-            suite, isa, _name = relative.split("/", 2)
+                 "image path (8.3) | format and ABI | original test name"]
+        for source, source_relative, image_relative, kind in selected:
+            _suite, isa, _name = image_relative.split("/", 2)
             machine_file = source.parent / ".machine"
             machine = machine_file.read_text(encoding="ascii").strip() if machine_file.is_file() else "unknown"
             if kind == "PE":
-                environment = "Windows x86_64; no KaleidOS PE loader"
+                environment = f"{machine}; Windows PE, no KaleidOS PE loader"
             elif isa == "x86_64":
-                environment = "Linux x86_64 native reference"
+                environment = f"{machine}; Linux x86_64 native reference"
             else:
                 environment = f"{machine}; KaleidOS syscall compatibility unverified"
-            lines.append(f"{relative} | {kind} | {environment}")
+            lines.append(f"{image_relative} | {kind} {environment} | source {source_relative}")
         tests_file = Path(temporary) / "TESTS.TXT"
         tests_file.write_text("\r\n".join(lines) + "\r\n", encoding="ascii")
         command(["mcopy", "-o", "-i", str(image), str(tests_file), "::/TESTS.TXT"])
@@ -96,43 +114,53 @@ def verify(args):
         log_root = args.logs.resolve() if args.logs else None
         if args.run_native and log_root:
             log_root.mkdir(parents=True, exist_ok=True)
-        for _source, relative, _kind in found:
-            suite, isa, _name = relative.split("/", 2)
-            command(["mdir", "-i", str(image), f"::/{suite}/{isa}"])
-            extracted = destination / relative
+        groups = {}
+        for _source, _source_relative, image_relative, _kind in found:
+            suite, isa, _name = image_relative.split("/", 2)
+            groups.setdefault((suite, isa), []).append(image_relative)
+        for (suite, isa), paths in groups.items():
+            listing = command(["mdir", "-i", str(image), f"::/{suite}/{isa}"])
+            aliases = re.findall(r"^([A-Z0-9_~]{1,8})\s+([A-Z0-9_~]{1,3})\s+\d+\s",
+                                 listing, re.MULTILINE)
+            short_names = [f"{base}.{extension}" for base, extension in aliases]
+            if len(short_names) != len(paths) or len(set(short_names)) != len(short_names):
+                raise RuntimeError(f"FAT 8.3 names are missing or collide in {suite}/{isa}")
+        for _source, source_relative, image_relative, kind in found:
+            suite, isa, _name = image_relative.split("/", 2)
+            extracted = destination / image_relative
             extracted.parent.mkdir(parents=True, exist_ok=True)
-            command(["mcopy", "-i", str(image), f"::/{relative}", str(extracted)])
-            original = args.input.resolve() / relative
+            command(["mcopy", "-i", str(image), f"::/{image_relative}", str(extracted)])
+            original = args.input.resolve() / source_relative
             if extracted.stat().st_size != original.stat().st_size:
-                raise RuntimeError(f"size changed in FAT image: {relative}")
+                raise RuntimeError(f"size changed in FAT image: {image_relative}")
             command(["cmp", "--", str(original), str(extracted)])
-            if args.run_native and isa == "x86_64" and _kind == "ELF":
+            if args.run_native and isa == "x86_64" and kind == "ELF":
                 extracted.chmod(0o755)
-                run_directory = destination / ("run-" + relative.replace("/", "_"))
+                run_directory = destination / ("run-" + source_relative.replace("/", "_"))
                 run_directory.mkdir()
-                if relative.endswith("/posix_stat"):
+                if source_relative.endswith("/posix_stat"):
                     time.sleep(1.1 - (time.time() % 1))
                 try:
                     process = subprocess.run([str(extracted)], cwd=run_directory,
                                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                              stderr=subprocess.PIPE, timeout=30)
                 except (OSError, subprocess.TimeoutExpired) as error:
-                    raise RuntimeError(f"extracted Linux reference failed: {relative}: {error}") from error
+                    raise RuntimeError(f"extracted Linux reference failed: {source_relative}: {error}") from error
                 status = "PASS" if process.returncode == 0 else "FAIL"
-                reference_rows.append((relative, status, process.returncode))
+                reference_rows.append((source_relative, status, process.returncode))
                 if log_root:
-                    stem = relative.replace("/", "_")
+                    stem = source_relative.replace("/", "_")
                     (log_root / f"{stem}.stdout.log").write_bytes(process.stdout)
                     (log_root / f"{stem}.stderr.log").write_bytes(process.stderr)
-                print(f"extracted Linux reference {relative}: {status} (exit {process.returncode})")
+                print(f"extracted Linux reference {source_relative}: {status} (exit {process.returncode})")
                 if process.returncode != 0:
-                    raise RuntimeError(f"extracted Linux reference exited {process.returncode}: {relative}")
+                    raise RuntimeError(f"extracted Linux reference exited {process.returncode}: {source_relative}")
         test_list = destination / "TESTS.TXT"
         command(["mcopy", "-i", str(image), "::/TESTS.TXT", str(test_list)])
         declared = test_list.read_text(encoding="ascii")
-        for _source, relative, _kind in found:
-            if relative not in declared:
-                raise RuntimeError(f"missing manifest row: {relative}")
+        for _source, source_relative, image_relative, _kind in found:
+            if image_relative not in declared or f"source {source_relative}" not in declared:
+                raise RuntimeError(f"missing manifest mapping: {source_relative}")
         if reference_rows and log_root:
             report = ["path\tstatus\texit_status"]
             report.extend(f"{path}\t{status}\t{code}" for path, status, code in reference_rows)
