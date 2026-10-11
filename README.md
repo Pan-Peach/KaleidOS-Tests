@@ -19,6 +19,18 @@ with an explicit message when selected. LTP is optional and is not initialized
 by recursive submodule updates. `SUITE=all` therefore fails until each selected
 suite is implemented; nothing is skipped.
 
+The remaining suite adapters must follow their upstream build contracts:
+
+- Picolibc uses Meson options `tests=true` and `tests-enable-posix-io=false` for
+  the focused suite; `native-tests=true` explicitly tests the host libc and must
+  not be used to claim Picolibc coverage. See the [upstream build options](https://github.com/picolibc/picolibc/blob/main/doc/build.md).
+- LTP's Open POSIX Testsuite has its own configure and generated Makefiles. The
+  upstream quick start uses `--with-open-posix-testsuite` and
+  `make generate-makefiles` before selecting tests. See [LTP's quick start](https://github.com/linux-test-project/ltp/blob/master/doc/users/quick_start.rst).
+- BusyBox `testsuite/README` runs the upstream `./runtest` shell harness and
+  accepts applet names as selectors; those shell fragments and test data are
+  not standalone ELF tests. See the [pinned upstream README](https://git.busybox.net/busybox/plain/testsuite/README).
+
 ## Build and verify
 
 From KaleidOS, initialize this repository and the libc-test source used by the
@@ -27,6 +39,12 @@ current builder, then run:
 ```sh
 git submodule update --init tests/kaleidos-tests
 git -C tests/kaleidos-tests submodule update --init third_party/libc-test
+```
+
+To explicitly fetch the optional LTP source, override its no-update default:
+
+```sh
+git -C tests/kaleidos-tests -c submodule.third_party/ltp.update=checkout submodule update --init third_party/ltp
 ```
 
 Then build and verify:
