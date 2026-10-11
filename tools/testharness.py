@@ -139,7 +139,8 @@ def main():
                             try:
                                 code, output = run_one(case, timeout=item.get("timeout", 60),
                                                        cwd=case.parent)
-                                status = "PASS" if code == 0 else "WARN" if code == 2 else "FAIL"
+                                status = {0: "PASS", 1: "FAIL", 2: "WARN",
+                                          4: "SKIP", 5: "SKIP"}.get(code, "FAIL")
                                 record(name, status, f"exit {code}", output)
                             except (OSError, subprocess.TimeoutExpired) as error:
                                 record(name, "FAIL", str(error))

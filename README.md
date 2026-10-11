@@ -78,7 +78,9 @@ tools are reported as errors; Open POSIX also requires Autoconf. The run
 harness prints each suite between
 separators, colors PASS green, FAIL red, and WARN/SKIP yellow on interactive
 terminals, prints each test's captured output beneath its result, and reports
-incompatible ISAs as `SKIP`; a skip is never counted as a pass. Use
+Open POSIX exit codes for unsupported and untested cases as `SKIP`, unresolved
+cases as `WARN`, and incompatible ISAs as `SKIP`; a skip is never counted as a
+pass. Use
 `--color always` or `--color never` when running `RUNTEST.PY` directly to
 override terminal detection.
 
