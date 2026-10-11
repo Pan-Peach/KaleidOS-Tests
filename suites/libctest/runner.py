@@ -74,9 +74,11 @@ def build(args):
         raise ValueError(f"compiler target {machine!r} does not match {args.target}")
     revision = subprocess.check_output(
         ["git", "-C", str(UPSTREAM), "rev-parse", "HEAD"], text=True).strip()
-    expected = (ROOT / "third_party" / "libc-test.commit").read_text().strip()
-    if revision != expected:
-        raise ValueError("libc-test checkout does not match third_party/libc-test.commit")
+    pinned = subprocess.check_output(
+        ["git", "-C", str(ROOT), "ls-tree", "HEAD", "--", "third_party/libc-test"],
+        text=True).split()
+    if len(pinned) != 4 or pinned[2] != revision:
+        raise ValueError("libc-test checkout does not match the KaleidOS-Tests gitlink")
     # Compare tracked content while ignoring CRLF-only checkout differences.
     # Git's porcelain status can report those as edits under Windows/MSYS2.
     dirty = subprocess.run(

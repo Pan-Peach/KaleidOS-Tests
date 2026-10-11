@@ -6,8 +6,8 @@ KaleidOS claim a PASS from a Linux reference run.
 
 ## Current state
 
-`libctest` is migrated from KaleidOS at the original upstream revision recorded
-in `third_party/libc-test.commit`. Its selected tests, diagnostics, and native
+`libctest` is migrated from KaleidOS at the original upstream revision pinned
+by the `third_party/libc-test` gitlink. Its selected tests, diagnostics, and native
 Linux/Windows build runner are retained. The first image builder supports Linux
 ELF builds for `x86_64`, `rv64`, `rv32`, `aarch64`, and `loongarch64`; cross builds
 require a Linux-targeting compiler for the requested ISA. A Linux x86_64 image
