@@ -45,6 +45,41 @@ def isa_for(machine):
     raise RuntimeError(f"unsupported compiler machine for image classification: {machine}")
 
 
+def compiler_for(target, args):
+    return {"x86_64": args.x86_64_cc, "rv64": args.rv64_cc, "rv32": args.rv32_cc,
+            "aarch64": args.aarch64_cc, "loongarch64": args.loongarch64_cc}[target]
+
+
+def abi_for(machine):
+    if "-linux-musl" in machine:
+        return "linux-musl"
+    if "-linux" in machine:
+        return "linux-gnu"
+    raise RuntimeError(f"unsupported userspace ABI: {machine}")
+
+
+def write_unsupported(root, suite, target, reason):
+    suite_root = root / suite / target
+    shutil.rmtree(suite_root, ignore_errors=True)
+    suite_root.mkdir(parents=True)
+    (suite_root / ".abi").write_text("linux-gnu\n", encoding="ascii")
+    (suite_root / ".libc").write_text("unsupported\n", encoding="ascii")
+    (suite_root / ".runlist.json").write_text(json.dumps([{
+        "name": suite, "status": "UNSUPPORTED", "reason": reason,
+    }], indent=2) + "\n", encoding="utf-8")
+
+
+def write_build_failure(root, suite, target, error):
+    suite_root = root / suite / target
+    shutil.rmtree(suite_root, ignore_errors=True)
+    suite_root.mkdir(parents=True)
+    (suite_root / ".abi").write_text("linux-gnu\n", encoding="ascii")
+    (suite_root / ".libc").write_text("unknown\n", encoding="ascii")
+    (suite_root / ".runlist.json").write_text(json.dumps([{
+        "name": suite, "status": "BUILD_FAIL", "reason": str(error),
+    }], indent=2) + "\n", encoding="utf-8")
+
+
 def elf_executable(path):
     try:
         header = path.read_bytes()[:20]
@@ -76,6 +111,9 @@ def build_libctest(target, artifact_root, args, output_dir):
     suite_root = artifact_root / "libctest" / target
     suite_root.mkdir(parents=True, exist_ok=True)
     (suite_root / ".machine").write_text(machine + "\n", encoding="ascii")
+    (suite_root / ".abi").write_text(abi_for(machine) + "\n", encoding="ascii")
+    (suite_root / ".libc").write_text("glibc\n" if "musl" not in machine else "musl\n",
+                                       encoding="ascii")
     build_data = json.loads((build_root / "build.json").read_text(encoding="utf-8"))
     runlist = []
     for binary in sorted((build_root / "bin").iterdir()):
@@ -102,7 +140,8 @@ def meson_passes(log):
 
 def build_picolibc(target, output_dir, artifact_root, args):
     if target != "x86_64":
-        raise RuntimeError("Picolibc Linux reference suite currently targets x86_64 only")
+        write_unsupported(artifact_root, "picolibc", target, "Picolibc adapter is x86_64 only")
+        return
     source = ROOT / "third_party" / "picolibc"
     cross_file = source / "scripts" / "cross-x86_64-linux-gnu.txt"
     if not (source / "meson.build").is_file():
@@ -128,6 +167,8 @@ def build_picolibc(target, output_dir, artifact_root, args):
     suite_root.mkdir(parents=True)
     machine = subprocess.check_output([args.x86_64_cc, "-dumpmachine"], text=True).strip()
     (suite_root / ".machine").write_text(machine + "\n", encoding="ascii")
+    (suite_root / ".abi").write_text("linux-gnu\n", encoding="ascii")
+    (suite_root / ".libc").write_text("picolibc\n", encoding="ascii")
     copied = {}
     for target_info in targets:
         if target_info.get("type") != "executable":
@@ -168,29 +209,34 @@ def build_picolibc(target, output_dir, artifact_root, args):
 
 
 def build_busybox(target, output_dir, artifact_root, args):
-    if target != "x86_64":
-        raise RuntimeError("BusyBox Linux reference tests currently target x86_64 only")
+    compiler = compiler_for(target, args)
+    cross = "" if target == "x86_64" else compiler.removesuffix("gcc")
     source = ROOT / "third_party" / "busybox"
     if not (source / "Makefile").is_file():
         raise RuntimeError("initialize third_party/busybox in KaleidOS-Tests first")
     build_dir = output_dir / "busybox-build" / target
     shutil.rmtree(build_dir, ignore_errors=True)
     build_dir.mkdir(parents=True)
-    run(["make", f"O={build_dir}", "defconfig"], cwd=source,
+    prefix = [f"CROSS_COMPILE={cross}"] if cross else []
+    run(["make", f"O={build_dir}", *prefix, "defconfig"], cwd=source,
         output=output_dir / "busybox-defconfig.log")
     config = build_dir / ".config"
     contents = config.read_text(encoding="utf-8")
-    if "CONFIG_TC=y" not in contents:
-        raise RuntimeError("BusyBox defconfig did not enable the tc applet as expected")
-    config.write_text(contents.replace("CONFIG_TC=y", "# CONFIG_TC is not set", 1),
-                       encoding="utf-8")
-    run(["make", f"O={build_dir}", "silentoldconfig"], cwd=source)
-    run(["make", f"O={build_dir}", f"-j{args.jobs}"], cwd=source,
+    contents = re.sub(r"(?m)^# CONFIG_STATIC is not set$", "CONFIG_STATIC=y", contents)
+    if target != "x86_64":
+        contents = re.sub(r"(?m)^CONFIG_SHA1_HWACCEL=y$",
+                          "# CONFIG_SHA1_HWACCEL is not set", contents)
+    contents = re.sub(r"(?m)^CONFIG_TC=y$", "# CONFIG_TC is not set", contents)
+    if "CONFIG_STATIC=y" not in contents:
+        contents += "\nCONFIG_STATIC=y\n"
+    config.write_text(contents, encoding="utf-8")
+    run(["make", f"O={build_dir}", *prefix, "silentoldconfig"], cwd=source)
+    run(["make", f"O={build_dir}", *prefix, f"-j{args.jobs}"], cwd=source,
         output=output_dir / "busybox-build.log")
     binary = build_dir / "busybox"
     if not binary.is_file():
         raise RuntimeError("BusyBox build completed without a busybox executable")
-    machine = subprocess.check_output([args.x86_64_cc, "-dumpmachine"], text=True).strip()
+    machine = subprocess.check_output([compiler, "-dumpmachine"], text=True).strip()
     if isa_for(machine) != target:
         raise RuntimeError(f"{args.x86_64_cc} targets {machine}, expected {target}")
 
@@ -198,6 +244,9 @@ def build_busybox(target, output_dir, artifact_root, args):
     shutil.rmtree(suite_root, ignore_errors=True)
     suite_root.mkdir(parents=True)
     (suite_root / ".machine").write_text(machine + "\n", encoding="ascii")
+    (suite_root / ".abi").write_text(abi_for(machine) + "\n", encoding="ascii")
+    (suite_root / ".libc").write_text("glibc\n" if "musl" not in machine else "musl\n",
+                                       encoding="ascii")
     shutil.copy2(binary, suite_root / "busybox")
     shutil.copy2(config, suite_root / "bbconfig.data")
 
@@ -219,8 +268,9 @@ def build_busybox(target, output_dir, artifact_root, args):
         "ECHO": str(echo_helper),
     }
     test_log = output_dir / "busybox-testsuite.log"
-    run(["sh", str(test_dir / "runtest"), *BUSYBOX_APPLETS], cwd=test_dir,
-        env={**os.environ, **environment}, output=test_log)
+    if target == "x86_64":
+        run(["sh", str(test_dir / "runtest"), *BUSYBOX_APPLETS], cwd=test_dir,
+            env={**os.environ, **environment}, output=test_log)
     with tarfile.open(suite_root / "bbtests.data", "w:gz") as archive:
         archive.add(source / "testsuite", arcname="testsuite")
     shutil.copy2(echo_helper, suite_root / "bbecho")
@@ -235,7 +285,8 @@ def build_busybox(target, output_dir, artifact_root, args):
 
 def build_openposix(target, output_dir, artifact_root, args):
     if target != "x86_64":
-        raise RuntimeError("Open POSIX Linux reference tests currently target x86_64 only")
+        write_unsupported(artifact_root, "openposix", target, "Open POSIX adapter is x86_64 only")
+        return
     source = ROOT / "third_party" / "open_posix_testsuite" / "testcases" / "open_posix_testsuite"
     if not (source / "Makefile").is_file():
         raise RuntimeError("prepare third_party/open_posix_testsuite with tools/prepare-openposix.sh first")
@@ -265,6 +316,9 @@ def build_openposix(target, output_dir, artifact_root, args):
     if isa_for(machine) != target:
         raise RuntimeError(f"{args.x86_64_cc} targets {machine}, expected {target}")
     (suite_root / ".machine").write_text(machine + "\n", encoding="ascii")
+    (suite_root / ".abi").write_text(abi_for(machine) + "\n", encoding="ascii")
+    (suite_root / ".libc").write_text("glibc\n" if "musl" not in machine else "musl\n",
+                                       encoding="ascii")
     archive_path = suite_root / "openposix.tar.gz"
     with tarfile.open(archive_path, "w:gz") as archive:
         archive.add(build_dir, arcname="open_posix_testsuite")
@@ -275,14 +329,83 @@ def build_openposix(target, output_dir, artifact_root, args):
     }], indent=2) + "\n", encoding="utf-8")
 
 
+def add_runtime_file(source, rootfs, absolute):
+    destination = rootfs / absolute.lstrip("/")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+
+
+def stage_runtime(artifact_root, rootfs, target, suites, args):
+    for directory in ("bin", "lib", "lib64", "etc", "dev", "proc", "tmp", "work", "logs"):
+        path = rootfs / directory
+        path.mkdir(parents=True, exist_ok=True)
+        if directory in ("tmp", "work", "logs"):
+            path.chmod(0o777)
+    for device in ("null", "zero", "random", "urandom", "tty"):
+        (rootfs / "dev" / device).touch(exist_ok=True)
+    busybox_root = artifact_root / "busybox" / target
+    busybox = busybox_root / "busybox"
+    if not busybox.is_file():
+        raise RuntimeError(f"no BusyBox runtime for {target}; cannot build a self-contained rootfs")
+    loader = subprocess.check_output(["readelf", "-l", str(busybox)], text=True)
+    if "Requesting program interpreter" in loader:
+        raise RuntimeError("rootfs BusyBox is not static")
+    available = set(subprocess.check_output([str(busybox), "--list"], text=True).splitlines()) if target == "x86_64" else None
+    applets = ("sh", "cp", "chmod", "mkdir", "rm", "sed", "timeout", "ln", "cat", "echo", "uname",
+               "ls", "pwd", "printf", "grep", "awk", "head", "tail", "find", "cmp", "cut", "tr", "wc")
+    if available is not None:
+        missing = sorted(set(applets) - available)
+        if missing:
+            raise RuntimeError("static BusyBox is missing required applets: " + ", ".join(missing))
+    shutil.copy2(busybox, rootfs / "bin" / "busybox")
+    for applet in applets:
+        shutil.copy2(busybox, rootfs / "bin" / applet)
+    (rootfs / "etc" / "passwd").write_text("root:x:0:0:root:/root:/bin/sh\n", encoding="ascii")
+    (rootfs / "etc" / "group").write_text("root:x:0:\n", encoding="ascii")
+
+    executables = []
+    for suite in suites:
+        suite_root = artifact_root / suite / target
+        for path in suite_root.iterdir():
+            if path.is_file() and not path.name.startswith(".") and elf_executable(path):
+                executables.append(path)
+        if suite == "openposix":
+            built_tree = artifact_root.parent / "openposix-build" / target / "open_posix_testsuite"
+            executables.extend(built_tree.rglob("*.run-test"))
+
+    for binary in executables:
+        header = subprocess.check_output(["readelf", "-l", str(binary)], text=True)
+        interpreter = re.search(r"Requesting program interpreter: ([^]]+)", header)
+        if not interpreter:
+            continue
+        if target != "x86_64":
+            raise RuntimeError(f"dynamic cross-ABI runtime collection is not configured: {binary.name}")
+        loader_path = interpreter.group(1)
+        loader_source = Path(loader_path)
+        if not loader_source.is_file():
+            raise RuntimeError(f"ELF interpreter not found: {loader_path} ({binary})")
+        add_runtime_file(loader_source, rootfs, loader_path)
+        dependencies = subprocess.check_output(["ldd", str(binary)], text=True, stderr=subprocess.STDOUT)
+        if "not found" in dependencies:
+            raise RuntimeError(f"unresolved ELF dependency in {binary}:\n{dependencies}")
+        for resolved in re.findall(r"=>\s+(/[^\s]+)", dependencies):
+            source = Path(resolved)
+            if not source.is_file():
+                raise RuntimeError(f"ELF dependency not found: {resolved} ({binary})")
+            add_runtime_file(source, rootfs, resolved)
+    (rootfs / "ABI.TXT").write_text(
+        f"arch={target}\ntarget={args.target}\nabi={args.abi}\nfilesystem={args.fs}\n",
+        encoding="ascii")
+
+
 def build(args):
     output_dir = args.out.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "tests.img").unlink(missing_ok=True)
+    target = args.targets
+    image = output_dir / f"test-{target}.img"
+    image.unlink(missing_ok=True)
     suites = args.suite.split(",") if args.suite != "all" else [
-        "libctest", "picolibc", "busybox"]
-    if args.suite == "all" and "x86_64" in args.targets.split(","):
-        suites.append("openposix")
+        "libctest", "picolibc", "openposix", "busybox"]
     if not suites or len(set(suites)) != len(suites):
         raise RuntimeError("SUITE must be a non-empty, duplicate-free list")
     if "ltp" in suites:
@@ -292,15 +415,14 @@ def build(args):
         raise RuntimeError("unknown suites: " + ", ".join(unknown))
     if "openposix" in suites:
         suites = [suite for suite in suites if suite != "openposix"] + ["openposix"]
-    targets = args.targets.split(",")
-    if not targets or len(set(targets)) != len(targets):
-        raise RuntimeError("TARGETS must be a comma-separated set of ISA names")
+    if target not in ("x86_64", "rv64", "rv32", "aarch64", "loongarch64"):
+        raise RuntimeError(f"unsupported ISA target: {target}")
     if args.fs not in ("fat", "ext4"):
         raise RuntimeError("FS must be fat or ext4")
     artifact_root = output_dir / "artifacts"
     shutil.rmtree(artifact_root, ignore_errors=True)
     for suite in suites:
-        for target in targets:
+        try:
             if suite == "libctest":
                 build_libctest(target, artifact_root, args, output_dir)
             elif suite == "picolibc":
@@ -309,20 +431,59 @@ def build(args):
                 build_openposix(target, output_dir, artifact_root, args)
             else:
                 build_busybox(target, output_dir, artifact_root, args)
+        except (OSError, RuntimeError, subprocess.CalledProcessError, tarfile.TarError) as error:
+            print(f"BUILD_FAIL {suite}/{target}: {error}", file=sys.stderr, flush=True)
+            write_build_failure(artifact_root, suite, target, error)
+
+    # BusyBox is the image's shell/tool runtime even when its tests are not selected.
+    busybox_dir = artifact_root / "busybox" / target
+    if not (busybox_dir / "busybox").is_file():
+        if "busybox" in suites:
+            raise RuntimeError("BusyBox suite build failed; its static shell is required by the test rootfs")
+        try:
+            build_busybox(target, output_dir, artifact_root, args)
+        except (OSError, RuntimeError, subprocess.CalledProcessError, tarfile.TarError) as error:
+            if "busybox" not in suites:
+                write_build_failure(artifact_root, "busybox", target, error)
+            raise RuntimeError(f"cannot produce a runnable rootfs without BusyBox: {error}") from error
+
+    valid_tests = 0
+    build_failures = []
+    for suite in suites:
+        sidecar = artifact_root / suite / target / ".runlist.json"
+        if not sidecar.is_file():
+            continue
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+        rows = data if isinstance(data, list) else [data]
+        valid_tests += sum(row.get("status", "BUILT") == "BUILT" for row in rows)
+        build_failures.extend(f"{suite}: {row.get('reason', 'build failed')}"
+                              for row in rows if row.get("status") == "BUILD_FAIL")
+    if valid_tests == 0:
+        raise RuntimeError("no selected Suite produced an executable test; refusing to report a successful image")
+
+    runtime_root = output_dir / "rootfs"
+    shutil.rmtree(runtime_root, ignore_errors=True)
+    stage_runtime(artifact_root, runtime_root, target, suites, args)
     run([sys.executable, str(IMAGE), "pack", "--input", str(artifact_root),
          "--suites", ",".join(suites), "--fs", args.fs,
-         "--output", str(output_dir / "tests.img")])
+         "--arch", target, "--runtime", str(runtime_root), "--output", str(image)])
     run([sys.executable, str(IMAGE), "verify", "--input", str(artifact_root),
          "--suites", ",".join(suites), "--fs", args.fs,
-         "--image", str(output_dir / "tests.img")])
-    print(f"test image ready: {output_dir / 'tests.img'}")
+         "--arch", target, "--runtime", str(runtime_root), "--image", str(image)])
+    print(f"test image ready: {image}")
+    if build_failures:
+        raise RuntimeError("one or more selected Suite builds failed: " + "; ".join(build_failures))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", default="all", help="all or comma-separated suite names")
-    parser.add_argument("--targets", default="x86_64", help="comma-separated ISA names")
+    parser.add_argument("--targets", default="x86_64", help="one ISA for this image")
     parser.add_argument("--fs", default="fat", help="disk filesystem: fat or ext4")
+    parser.add_argument("--target", choices=("linux", "kaleid"), default="linux",
+                        help="intended execution environment; never starts tests")
+    parser.add_argument("--abi", choices=("linux-gnu", "linux-musl", "kaleidos-posix"),
+                        help="runtime ABI recorded in ABI.TXT")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--x86-64-cc", dest="x86_64_cc", default="gcc")
     parser.add_argument("--rv64-cc", default="riscv64-linux-gnu-gcc")
@@ -332,6 +493,10 @@ def main():
     parser.add_argument("--jobs", type=int, default=4)
     args = parser.parse_args()
     try:
+        if "," in args.targets:
+            raise RuntimeError("build one ISA per image; pass one value to --targets")
+        if args.abi is None:
+            args.abi = "kaleidos-posix" if args.target == "kaleid" else "linux-gnu"
         if args.jobs < 1:
             raise RuntimeError("--jobs must be positive")
         build(args)

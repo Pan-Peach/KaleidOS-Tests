@@ -3,18 +3,19 @@
 set -u
 
 usage() {
-    echo 'Usage: sh RUNTEST.SH [--suite NAME[,NAME]] [--case TEXT] [--isa ISA] [--logs DIR] [--color auto|always|never]'
+    echo 'Usage: sh RUNTEST.SH [--suite NAME[,NAME]] [--case TEXT] [--isa ISA] [--abi ABI] [--logs DIR] [--color auto|always|never]'
 }
-suites= case_filter= isa= logs= color=auto
+suites= case_filter= isa= abi= logs= color=auto
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --help|-h) usage; exit 0 ;;
-        --suite|--case|--isa|--logs|--color)
+        --suite|--case|--isa|--abi|--logs|--color)
             [ "$#" -ge 2 ] || { usage >&2; exit 2; }
             case "$1" in
                 --suite) suites="${suites:+$suites,}$2" ;;
                 --case) case_filter=$2 ;;
                 --isa) isa=$2 ;;
+                --abi) abi=$2 ;;
                 --logs) logs=$2 ;;
                 --color) color=$2 ;;
             esac
@@ -27,6 +28,12 @@ case "$0" in */*) script_dir=${0%/*} ;; *) script_dir=. ;; esac
 TEST_ROOT=$(CDPATH= cd "$script_dir" && pwd) || exit 2
 export TEST_ROOT
 [ -r "$TEST_ROOT/RUNLIST.TXT" ] || { echo 'Missing RUNLIST.TXT; rebuild this image.' >&2; exit 2; }
+image_abi=$(sed -n 's/^abi=//p' "$TEST_ROOT/ABI.TXT" 2>/dev/null | sed -n '1p')
+image_arch=$(sed -n 's/^arch=//p' "$TEST_ROOT/ABI.TXT" 2>/dev/null | sed -n '1p')
+[ -n "$abi" ] || abi=$image_abi
+[ -n "$abi" ] || { echo 'Missing ABI.TXT abi field; rebuild this image.' >&2; exit 2; }
+PATH=/bin:/usr/bin
+export PATH
 if [ -z "$isa" ]; then
     machine=$(uname -m 2>/dev/null || echo unknown)
     case "$machine" in
@@ -92,7 +99,7 @@ summary() {
         '--------------------------------------------------------' "$suite" "$passed" "$failed" "$skipped" \
         '--------------------------------------------------------'
 }
-while IFS='|' read -r current required_isa name wrapper deadline built reason requires; do
+while IFS='|' read -r current required_abi libc name wrapper deadline built reason requires; do
     [ -n "$current" ] || continue
     if [ -n "$suites" ]; then
         case ",$suites," in *",$current,"*) ;; *) continue ;; esac
@@ -105,10 +112,14 @@ while IFS='|' read -r current required_isa name wrapper deadline built reason re
     fi
     count=$((count + 1))
     status= detail= output=
-    if [ "$required_isa" != "$isa" ]; then
-        status=SKIP; detail="requires $required_isa; running $isa"
-    elif [ "$built" = UNSUPPORTED ]; then
+    if [ "$built" = UNSUPPORTED ]; then
         status=SKIP; detail=$reason
+    elif [ "$built" = BUILD_FAIL ]; then
+        status=BUILD_FAIL; detail=$reason
+    elif [ "$image_arch" != "$isa" ]; then
+        status=SKIP; detail="image requires ISA $image_arch; running $isa"
+    elif [ "$required_abi" != "$abi" ]; then
+        status=SKIP; detail="requires ABI $required_abi; image ABI is $abi ($libc)"
     elif [ "$built" != BUILT ]; then
         status=FAIL; detail="build $built: $reason"
     elif [ -n "$missing" ]; then
@@ -141,7 +152,8 @@ while IFS='|' read -r current required_isa name wrapper deadline built reason re
             detail="exit $code"
             status=FAIL
             if [ "$code" -eq 0 ]; then status=PASS
-            elif [ "$code" -eq 124 ]; then detail="timeout after ${deadline}s"
+            elif [ "$code" -eq 124 ] || [ "$code" -eq 137 ]; then status=TIMEOUT; detail="timeout after ${deadline}s"
+            elif [ "$code" -ge 128 ]; then status=CRASH; detail="signal $((code - 128))"
             elif [ "$suite" = openposix ]; then
                 case "$code" in 2) status=WARN ;; 4|5) status=SKIP ;; esac
             fi
@@ -152,12 +164,12 @@ while IFS='|' read -r current required_isa name wrapper deadline built reason re
     fi
     case "$status" in
         PASS) paint=$green; passed=$((passed + 1)) ;;
-        FAIL) paint=$red; failed=$((failed + 1)); total_failed=$((total_failed + 1)) ;;
-        *) paint=$yellow; skipped=$((skipped + 1)) ;;
+        SKIP|WARN) paint=$yellow; skipped=$((skipped + 1)) ;;
+        *) paint=$red; failed=$((failed + 1)); total_failed=$((total_failed + 1)) ;;
     esac
     printf '%s%-7s%s %s (%s)\n' "$paint" "$status" "$reset" "$name" "$detail"
     [ -z "$output" ] || sed 's/^/        /' "$output"
-    printf '%s|%s|%s|%s|%s\n' "$suite" "$required_isa" "$name" "$status" "$detail" >> "$report" || exit 2
+    printf '%s|%s|%s|%s|%s\n' "$suite" "$required_abi" "$name" "$status" "$detail" >> "$report" || exit 2
 done < "$TEST_ROOT/RUNLIST.TXT"
 summary
 printf '\nResults: %s\n' "$report"

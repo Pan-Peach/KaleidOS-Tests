@@ -2,50 +2,49 @@
 set -eu
 
 image=$1
-logs=${2:-}
-filesystem=${3:-fat}
-if [ "$#" -ge 3 ]; then shift 3; else set --; fi
-mountpoint=$(mktemp -d "${TMPDIR:-/tmp}/kaleidos-test-mount.XXXXXX")
-mounted=0
+logs=$2
+filesystem=$3
+shift 3
+if [ "$filesystem" != ext4 ]; then
+    echo 'Linux chroot execution requires FS=ext4; FAT remains available for KaleidOS.' >&2
+    exit 2
+fi
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo "$0" "$image" "$logs" "$filesystem" "$@"
+fi
+
+mountpoint=$(mktemp -d "${TMPDIR:-/tmp}/kaleidos-test-chroot.XXXXXX")
+bound_devices=
+proc_mounted=0
+root_mounted=0
+logs_mounted=0
 cleanup() {
-    if [ "$mounted" -eq 1 ]; then
-        if [ "$(id -u)" -eq 0 ]; then umount "$mountpoint"; else sudo umount "$mountpoint"; fi
+    set +e
+    if [ "${logs_mounted:-0}" -eq 1 ]; then umount "$mountpoint/logs" && logs_mounted=0; fi
+    if [ "$proc_mounted" -eq 1 ]; then umount "$mountpoint/proc" && proc_mounted=0; fi
+    for device in $bound_devices; do
+        umount "$device" 2>/dev/null || umount -l "$device" 2>/dev/null
+    done
+    if [ "$root_mounted" -eq 1 ]; then
+        umount "$mountpoint" 2>/dev/null || umount -l "$mountpoint" 2>/dev/null
+        [ "$?" -ne 0 ] || root_mounted=0
     fi
-    rm -rf "$mountpoint"
+    if [ "$root_mounted" -eq 0 ]; then rm -rf "$mountpoint";
+    else echo "warning: leaving mounted chroot tree at $mountpoint for manual cleanup" >&2; fi
 }
 trap cleanup EXIT HUP INT TERM
 
-if [ "$filesystem" = fat ]; then
-    if [ "$(id -u)" -eq 0 ]; then
-        mount -t vfat -o "loop,exec,uid=$(id -u),gid=$(id -g),umask=022" "$image" "$mountpoint" && mounted=1 || true
-    else
-        sudo mount -t vfat -o "loop,exec,uid=$(id -u),gid=$(id -g),umask=022" "$image" "$mountpoint" && mounted=1 || true
-    fi
-elif [ "$filesystem" = ext4 ]; then
-    if [ "$(id -u)" -eq 0 ]; then
-        mount -t ext4 -o loop,exec "$image" "$mountpoint" && mounted=1 || true
-    else
-        sudo mount -t ext4 -o loop,exec "$image" "$mountpoint" && mounted=1 || true
-    fi
-else
-    echo "unsupported filesystem '$filesystem'; use fat or ext4" >&2
-    exit 2
-fi
+mount -t ext4 -o loop,exec "$image" "$mountpoint"
+root_mounted=1
+for device in null zero random urandom tty; do
+    mount --bind "/dev/$device" "$mountpoint/dev/$device"
+    bound_devices="$mountpoint/dev/$device $bound_devices"
+done
+mount -t proc proc "$mountpoint/proc"
+proc_mounted=1
+mkdir -p "$logs"
+mount --bind "$logs" "$mountpoint/logs"
+logs_mounted=1
 
-if [ "$mounted" -eq 0 ]; then
-    echo "Loop mount unavailable; extracting the $filesystem image to a temporary directory." >&2
-    if [ "$filesystem" = fat ]; then
-        mcopy -s -i "$image" '::/*' "$mountpoint"
-    else
-        debugfs -R "rdump / $mountpoint" "$image" >/dev/null
-    fi
-fi
-if [ ! -r "$mountpoint/RUNTEST.SH" ]; then
-    echo 'Image has no RUNTEST.SH; rebuild it with ACTION=build before running.' >&2
-    exit 2
-fi
-if [ -n "$logs" ]; then
-    sh "$mountpoint/RUNTEST.SH" --logs "$logs" "$@"
-else
-    sh "$mountpoint/RUNTEST.SH" "$@"
-fi
+cd /
+chroot "$mountpoint" /bin/sh /RUNTEST.SH --logs /logs "$@"

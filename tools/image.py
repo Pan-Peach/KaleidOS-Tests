@@ -22,33 +22,31 @@ def command(args):
         raise RuntimeError(error.output.strip()) from error
 
 
-def entries(root, suites, filesystem="fat"):
+def set_difference(expected, actual):
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    return f"missing={missing[:8]} (+{max(0, len(missing) - 8)}), extra={extra[:8]} (+{max(0, len(extra) - 8)})"
+
+
+def entries(root, suites, arch, filesystem="fat"):
     result = []
+    used_names = {}
     for suite in suites:
-        suite_root = root / suite
+        suite_root = root / suite / arch
         if not suite_root.is_dir():
-            raise RuntimeError(f"no built artifacts for suite {suite}; build it first")
-        for isa_root in sorted(path for path in suite_root.iterdir() if path.is_dir()):
-            files = sorted(path for path in isa_root.iterdir()
-                           if path.is_file() and not path.name.startswith("."))
-            if not files:
-                raise RuntimeError(f"empty artifact directory: {isa_root}")
-            used = set()
-            for path in files:
-                source_relative = path.relative_to(root).as_posix()
-                header = path.read_bytes()[:4]
-                kind = "ELF" if header == b"\x7fELF" else "PE" if header[:2] == b"MZ" else "DATA"
-                if filesystem == "ext4":
-                    image_relative = f"{isa_root.parent.name}/{isa_root.name}/{path.name}"
-                    result.append((path, source_relative, image_relative, kind))
-                    continue
-                extension = {"ELF": "ELF", "PE": "EXE", "DATA": "DAT"}[kind]
-                stem = path.stem.upper()
-                for prefix in ("COMPILER_", "LIBC_", "POSIX_"):
-                    if stem.startswith(prefix):
-                        stem = stem[len(prefix):]
-                        break
-                stem = re.sub(r"[^A-Z0-9]", "", stem) or "TEST"
+            raise RuntimeError(f"no {arch} artifacts for suite {suite}; build it first")
+        files = sorted(path for path in suite_root.iterdir()
+                       if path.is_file() and not path.name.startswith("."))
+        used = used_names.setdefault(suite, set())
+        for path in files:
+            source_relative = path.relative_to(root).as_posix()
+            header = path.read_bytes()[:20]
+            kind = "ELF" if header[:4] == b"\x7fELF" else "DATA"
+            if filesystem == "ext4":
+                image_relative = f"{suite}/{path.name}"
+            else:
+                extension = "ELF" if kind == "ELF" else "DAT"
+                stem = re.sub(r"[^A-Z0-9]", "", path.stem.upper()) or "TEST"
                 base = stem[:8]
                 candidate = f"{base}.{extension}"
                 suffix = 1
@@ -57,23 +55,59 @@ def entries(root, suites, filesystem="fat"):
                     candidate = f"{base[:8-len(tail)]}{tail}.{extension}"
                     suffix += 1
                 used.add(candidate)
-                image_relative = f"{isa_root.parent.name}/{isa_root.name}/{candidate}"
-                result.append((path, source_relative, image_relative, kind))
+                image_relative = f"{suite}/{candidate}"
+            result.append((path, source_relative, image_relative, kind))
     if not result:
         raise RuntimeError("selected suites produced no files")
+    return result
+
+
+def runtime_entries(root, filesystem):
+    result = []
+    used = {}
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        relative = path.relative_to(root).as_posix()
+        if filesystem == "ext4":
+            image_relative = relative
+        else:
+            parent = str(Path(relative).parent)
+            if relative == "ABI.TXT":
+                image_relative = "ABI.TXT"
+                result.append((path, relative, image_relative, "DATA"))
+                continue
+            is_applet = parent == "bin"
+            extension = "" if is_applet else "ELF" if path.read_bytes()[:4] == b"\x7fELF" else "DAT"
+            stem = re.sub(r"[^A-Z0-9]", "", (path.stem if not is_applet else path.name).upper()) or "FILE"
+            names = used.setdefault(parent, set())
+            base = stem[:8]
+            candidate = f"{base}.{extension}" if extension else base
+            suffix = 1
+            while candidate in names:
+                tail = str(suffix)
+                short = f"{base[:8-len(tail)]}{tail}"
+                candidate = f"{short}.{extension}" if extension else short
+                suffix += 1
+            names.add(candidate)
+            image_relative = f"{parent}/{candidate}" if parent != "." else candidate
+        result.append((path, relative, image_relative,
+                       "ELF" if path.read_bytes()[:4] == b"\x7fELF" else "DATA"))
     return result
 
 
 def pack(args):
     if args.fs not in ("fat", "ext4"):
         raise RuntimeError("FS must be fat or ext4")
-    selected = entries(args.input.resolve(), args.suites.split(","), args.fs)
+    selected = entries(args.input.resolve(), args.suites.split(","), args.arch, args.fs)
+    runtime_root = args.runtime.resolve()
+    if not runtime_root.is_dir():
+        raise RuntimeError(f"runtime root not found: {runtime_root}")
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="kaleidos-test-image-") as temporary:
         selected, cases_file = prepare(args.input.resolve(), args.suites.split(","),
-                                       selected, Path(temporary) / "shell")
+                                       args.arch, selected, Path(temporary) / "shell")
+        selected += runtime_entries(runtime_root, args.fs)
         image = Path(temporary) / "tests.img"
         payload_bytes = sum(source.stat().st_size for source, *_rest in selected)
         reserve = max(4 * 1024 * 1024, payload_bytes // 8)
@@ -86,25 +120,25 @@ def pack(args):
         harness = Path(__file__).with_name("testharness.sh")
         if not harness.is_file():
             raise RuntimeError("tools/testharness.sh is missing")
-        lines = [f"KaleidOS unified {args.fs} test disk; run sh /RUNTEST.SH.",
+        metadata = (runtime_root / "ABI.TXT").read_text(encoding="ascii")
+        lines = [f"KaleidOS {args.arch} {args.abi} {args.fs} test disk; run sh /RUNTEST.SH.",
+                 metadata.strip(),
                  "image path | format and ABI | original test name"]
         for source, source_relative, image_relative, kind in selected:
-            _suite, isa, _name = image_relative.split("/", 2)
-            machine_file = args.input.resolve() / _suite / isa / ".machine"
+            parts = image_relative.split("/", 1)
+            suite = parts[0] if parts[0] in args.suites.split(",") else "runtime"
+            machine_file = args.input.resolve() / suite / args.arch / ".machine"
             machine = machine_file.read_text(encoding="ascii").strip() if machine_file.is_file() else "unknown"
-            if kind == "PE":
-                environment = f"{machine}; Windows PE, no KaleidOS PE loader"
-            elif isa == "x86_64":
-                environment = f"{machine}; Linux x86_64 native reference"
-            else:
-                environment = f"{machine}; KaleidOS syscall compatibility unverified"
+            environment = f"{machine}; {args.abi}; runtime/test ABI is recorded in RUNLIST.TXT"
             lines.append(f"{image_relative} | {kind} {environment} | source {source_relative}")
         tests_file = Path(temporary) / "TESTS.TXT"
         tests_file.write_text("\r\n".join(lines) + "\r\n", encoding="ascii")
         if args.fs == "fat":
             command(["mkfs.vfat", "-F", "32", "-n", "KALEIDOST", str(image)])
             directories = sorted({str(Path(image_relative).parent)
-                                  for _source, _source_relative, image_relative, _kind in selected},
+                                  for _source, _source_relative, image_relative, _kind in selected}
+                                 | {path.relative_to(runtime_root).as_posix()
+                                    for path in runtime_root.rglob("*") if path.is_dir()},
                                 key=lambda item: (item.count("/"), item))
             created = set()
             for directory in directories:
@@ -123,6 +157,7 @@ def pack(args):
         else:
             stage = Path(temporary) / "ext4-root"
             stage.mkdir()
+            shutil.copytree(runtime_root, stage, dirs_exist_ok=True)
             for source, _source_relative, image_relative, _kind in selected:
                 destination = stage / image_relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -138,10 +173,11 @@ def pack(args):
 
 
 def verify(args):
-    found = entries(args.input.resolve(), args.suites.split(","), args.fs)
+    found = entries(args.input.resolve(), args.suites.split(","), args.arch, args.fs)
     with tempfile.TemporaryDirectory(prefix="kaleidos-shell-verify-") as temporary:
         found, cases_file = prepare(args.input.resolve(), args.suites.split(","),
-                                    found, Path(temporary))
+                                    args.arch, found, Path(temporary))
+        found += runtime_entries(args.runtime.resolve(), args.fs)
         return verify_prepared(args, found, cases_file)
 
 
@@ -168,38 +204,43 @@ def verify_prepared(args, found, cases_file):
             if current_directory:
                 actual_directories.add(current_directory)
             continue
-        file_entry = re.match(r"([A-Z0-9_~]{1,8})\s+([A-Z0-9_~]{1,3})\s+\d+\s", line)
+        file_entry = re.match(r"([A-Z0-9_~]{1,8})(?:\s+([A-Z0-9_~]{1,3}))?\s+\d+\s", line)
         if file_entry:
-            name = f"{file_entry.group(1)}.{file_entry.group(2)}"
+            name = file_entry.group(1)
+            if file_entry.group(2):
+                name += f".{file_entry.group(2)}"
             actual_files.add(f"{current_directory}/{name}" if current_directory else name)
     expected_files = {image_relative for _source, _source_relative, image_relative, _kind in found}
-    expected_files.update({"TESTS.TXT", "RUNLIST.TXT", "RUNTEST.SH"})
-    expected_directories = {"/".join(parts) for suite, isa, _name in
-                            (relative.split("/", 2) for relative in expected_files if "/" in relative)
-                            for parts in ((suite,), (suite, isa))}
+    expected_files.update({"TESTS.TXT", "RUNLIST.TXT", "RUNTEST.SH", "ABI.TXT"})
+    expected_directories = set()
+    for relative in expected_files:
+        parts = Path(relative).parts[:-1]
+        for index in range(1, len(parts) + 1):
+            expected_directories.add("/".join(parts[:index]))
+    expected_directories.update(path.relative_to(args.runtime.resolve()).as_posix()
+                                for path in args.runtime.resolve().rglob("*") if path.is_dir())
     if actual_files != expected_files:
-        raise RuntimeError(f"FAT file list differs: expected {sorted(expected_files)}, found {sorted(actual_files)}")
+        raise RuntimeError("FAT file list differs: " + set_difference(expected_files, actual_files))
     if actual_directories != expected_directories:
-        raise RuntimeError(f"FAT directories differ: expected {sorted(expected_directories)}, found {sorted(actual_directories)}")
+        raise RuntimeError("FAT directories differ: " + set_difference(expected_directories, actual_directories))
     with tempfile.TemporaryDirectory(prefix="kaleidos-test-verify-") as temporary:
         destination = Path(temporary)
         reference_rows = []
         log_root = args.logs.resolve() if args.logs else None
         if args.run_native and log_root:
             log_root.mkdir(parents=True, exist_ok=True)
-        groups = {}
-        for _source, _source_relative, image_relative, _kind in found:
-            suite, isa, _name = image_relative.split("/", 2)
-            groups.setdefault((suite, isa), []).append(image_relative)
-        for (suite, isa), paths in groups.items():
-            listing = command(["mdir", "-i", str(image), f"::/{suite}/{isa}"])
-            aliases = re.findall(r"^([A-Z0-9_~]{1,8})\s+([A-Z0-9_~]{1,3})\s+\d+\s",
+        directories = sorted({str(Path(path).parent) for path in expected_files if "/" in path})
+        for directory in directories:
+            listing = command(["mdir", "-i", str(image), f"::/{directory}"])
+            aliases = re.findall(r"^([A-Z0-9_~]{1,8})(?:\s+([A-Z0-9_~]{1,3}))?\s+\d+\s",
                                  listing, re.MULTILINE)
-            short_names = [f"{base}.{extension}" for base, extension in aliases]
-            if len(short_names) != len(paths) or len(set(short_names)) != len(short_names):
-                raise RuntimeError(f"FAT 8.3 names are missing or collide in {suite}/{isa}")
+            short_names = [f"{base}.{extension}" if extension else base
+                           for base, extension in aliases]
+            expected_in_directory = [path for path in expected_files
+                                     if str(Path(path).parent) == directory]
+            if len(short_names) != len(expected_in_directory) or len(set(short_names)) != len(short_names):
+                raise RuntimeError(f"FAT 8.3 names are missing or collide in {directory}")
         for source, source_relative, image_relative, kind in found:
-            suite, isa, _name = image_relative.split("/", 2)
             extracted = destination / image_relative
             extracted.parent.mkdir(parents=True, exist_ok=True)
             command(["mcopy", "-i", str(image), f"::/{image_relative}", str(extracted)])
@@ -207,7 +248,7 @@ def verify_prepared(args, found, cases_file):
             if extracted.stat().st_size != original.stat().st_size:
                 raise RuntimeError(f"size changed in FAT image: {image_relative}")
             command(["cmp", "--", str(original), str(extracted)])
-            if args.run_native and suite == "libctest" and isa == "x86_64" and kind == "ELF":
+            if args.run_native and suite == "libctest" and args.arch == "x86_64" and kind == "ELF":
                 extracted.chmod(0o755)
                 run_directory = destination / ("run-" + source_relative.replace("/", "_"))
                 run_directory.mkdir()
@@ -235,7 +276,8 @@ def verify_prepared(args, found, cases_file):
             if image_relative not in declared or f"source {source_relative}" not in declared:
                 raise RuntimeError(f"missing manifest mapping: {source_relative}")
         for root_file, source in (("RUNLIST.TXT", cases_file),
-                                  ("RUNTEST.SH", Path(__file__).with_name("testharness.sh"))):
+                                  ("RUNTEST.SH", Path(__file__).with_name("testharness.sh")),
+                                  ("ABI.TXT", args.runtime.resolve() / "ABI.TXT")):
             extracted_root = destination / root_file
             command(["mcopy", "-i", str(image), f"::/{root_file}", str(extracted_root)])
             if source.read_bytes() != extracted_root.read_bytes():
@@ -259,14 +301,14 @@ def verify_ext4(args, image, found, cases_file):
         actual_files = {path.relative_to(destination).as_posix()
                         for path in destination.rglob("*") if path.is_file()}
         if actual_files != expected_files:
-            raise RuntimeError(f"ext4 file list differs: expected {sorted(expected_files)}, found {sorted(actual_files)}")
+            raise RuntimeError("ext4 file list differs: " + set_difference(expected_files, actual_files))
         for source, source_relative, image_relative, _kind in found:
             extracted = destination / image_relative
             original = source
             if extracted.stat().st_size != original.stat().st_size:
                 raise RuntimeError(f"size changed in ext4 image: {image_relative}")
             command(["cmp", "--", str(original), str(extracted)])
-            if args.run_native and image_relative.startswith("libctest/x86_64/") and _kind == "ELF":
+            if args.run_native and image_relative.startswith("libctest/") and args.arch == "x86_64" and _kind == "ELF":
                 run_directory = destination / ("run-" + source_relative.replace("/", "_"))
                 run_directory.mkdir()
                 if source_relative.endswith("/posix_stat"):
@@ -281,7 +323,8 @@ def verify_ext4(args, image, found, cases_file):
             if image_relative not in declared or f"source {source_relative}" not in declared:
                 raise RuntimeError(f"missing manifest mapping: {source_relative}")
         for root_file, source in (("RUNLIST.TXT", cases_file),
-                                  ("RUNTEST.SH", Path(__file__).with_name("testharness.sh"))):
+                                  ("RUNTEST.SH", Path(__file__).with_name("testharness.sh")),
+                                  ("ABI.TXT", args.runtime.resolve() / "ABI.TXT")):
             if source.read_bytes() != (destination / root_file).read_bytes():
                 raise RuntimeError(f"{root_file} differs from the source")
         verify_runlist(cases_file, expected_files)
@@ -292,7 +335,7 @@ def verify_ext4(args, image, found, cases_file):
 def verify_runlist(manifest, expected_files):
     for line in manifest.read_text().splitlines():
         fields = line.split("|")
-        if len(fields) != 8 or fields[3] not in expected_files:
+        if len(fields) != 9 or fields[4] not in expected_files:
             raise RuntimeError(f"invalid shell run manifest row: {line}")
 
 
@@ -303,6 +346,9 @@ def main():
         sub = subparsers.add_parser(action)
         sub.add_argument("--input", type=Path, required=True, help="suite/isa artifact root")
         sub.add_argument("--suites", required=True, help="comma-separated suite names")
+        sub.add_argument("--arch", required=True, help="one ISA, represented by this image")
+        sub.add_argument("--abi", default="unknown", help="target runtime ABI label")
+        sub.add_argument("--runtime", type=Path, required=True, help="staged root filesystem runtime")
         sub.add_argument("--fs", default="fat", help="disk filesystem: fat or ext4")
         if action == "pack":
             sub.add_argument("--output", type=Path, required=True)
