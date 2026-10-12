@@ -166,6 +166,7 @@ def pack(args):
             shutil.copy2(runlist_file, stage / "RUNLIST.TXT")
             shutil.copy2(tests_file, stage / "TESTS.TXT")
             command(["mke2fs", "-q", "-F", "-t", "ext4", "-L", "KALEIDOST",
+                     "-b", "4096", "-I", "256", "-O", "64bit,metadata_csum,^orphan_file",
                      "-d", str(stage), str(image)])
         shutil.copyfile(image, output)
     print(f"image: {output} ({args.fs}, {output.stat().st_size} bytes, {len(selected)} artifacts)")
