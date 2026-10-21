@@ -11,3 +11,7 @@
 [submodule "third_party/busybox"]
 	path = third_party/busybox
 	url = https://git.busybox.net/busybox
+[submodule "third_party/wasi-testsuite"]
+	path = third_party/wasi-testsuite
+	url = https://github.com/WebAssembly/wasi-testsuite.git
+	branch = prod/testsuite-base
