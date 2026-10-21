@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "suites" / "libctest" / "runner.py"
 IMAGE = ROOT / "tools" / "image.py"
 BUSYBOX_APPLETS = ["cat", "echo", "cp", "ls", "rm", "pwd", "printf"]
+PINNED_WASI_REVISION = "d552798a246242c3efe6931314cdfa93d6eefa52"
 PICO_OPTIONS = [
     "-Dtests=true", "-Dnative-tests=false", "-Dtests-enable-posix-io=false",
     "-Dsemihost=false", "-Dos-linux=true", "-Dmultilib=false", "-Dtest-stdin=false",
@@ -329,6 +330,91 @@ def build_openposix(target, output_dir, artifact_root, args):
     }], indent=2) + "\n", encoding="utf-8")
 
 
+def check_wasi_submodule():
+    source = ROOT / "third_party" / "wasi-testsuite"
+    if not (source / "tests").is_dir():
+        raise RuntimeError("initialize third_party/wasi-testsuite in KaleidOS-Tests first")
+    try:
+        rev = subprocess.check_output(
+            ["git", "-C", str(source), "rev-parse", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        if rev != PINNED_WASI_REVISION:
+            raise RuntimeError(
+                f"third_party/wasi-testsuite revision {rev} does not match pinned {PINNED_WASI_REVISION}"
+            )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+
+def build_wasi(target, output_dir, artifact_root, args, smoke=False, suite="wasi"):
+    check_wasi_submodule()
+    source = ROOT / "third_party" / "wasi-testsuite"
+    suite_root = artifact_root / suite / target
+    shutil.rmtree(suite_root, ignore_errors=True)
+    suite_root.mkdir(parents=True)
+
+    (suite_root / ".machine").write_text("wasm32\n", encoding="ascii")
+    (suite_root / ".abi").write_text("wasm32-wasip1\n", encoding="ascii")
+    (suite_root / ".libc").write_text("wasi-libc\n", encoding="ascii")
+
+    # smoke covers assemblyscript (12) + c (14) = 26 tests
+    # full wasi covers assemblyscript (12) + c (14) + rust (46) = 72 tests
+    languages = ["assemblyscript", "c"] if smoke else ["assemblyscript", "c", "rust"]
+    runlist = []
+
+    for lang in languages:
+        sub_dir_name = "as" if lang == "assemblyscript" else lang
+        lang_testsuite = source / "tests" / lang / "testsuite" / "wasm32-wasip1"
+        if not lang_testsuite.is_dir():
+            raise RuntimeError(f"missing {lang} wasm32-wasip1 testsuite at {lang_testsuite}")
+
+        dst_dir = suite_root / sub_dir_name
+        dst_dir.mkdir(parents=True, exist_ok=True)
+
+        fixture_dir = lang_testsuite / "fs-tests.dir"
+        if fixture_dir.is_dir():
+            dst_fixture = dst_dir / "fs-tests.dir"
+            shutil.copytree(fixture_dir, dst_fixture, dirs_exist_ok=True)
+
+        for wasm in sorted(lang_testsuite.glob("*.wasm")):
+            shutil.copy2(wasm, dst_dir / wasm.name)
+            json_file = wasm.with_suffix(".json")
+            has_json = json_file.is_file()
+            test_config = {}
+            if has_json:
+                shutil.copy2(json_file, dst_dir / json_file.name)
+                try:
+                    test_config = json.loads(json_file.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as err:
+                    raise RuntimeError(f"corrupt wasi test config in {json_file}: {err}") from err
+
+            root_field = test_config.get("root")
+            root_rel = None
+            if root_field:
+                root_target = (lang_testsuite / root_field).resolve()
+                if not root_target.is_dir():
+                    raise RuntimeError(f"test {wasm.name} references missing root directory {root_field}")
+                root_rel = f"{suite}/{target}/{sub_dir_name}/{root_field}"
+
+            runlist.append({
+                "name": f"{sub_dir_name}/{wasm.stem}",
+                "source": f"{suite}/{target}/{sub_dir_name}/{wasm.name}",
+                "config": f"{suite}/{target}/{sub_dir_name}/{json_file.name}" if has_json else None,
+                "root": root_rel,
+                "status": "BUILT",
+                "reason": "-",
+                "abi": "wasm32-wasip1",
+                "language": lang,
+                "timeout": 30,
+                "args": test_config.get("args", []),
+                "env": test_config.get("env", {}),
+                "exit_code": test_config.get("exit_code", 0),
+            })
+
+    (suite_root / ".runlist.json").write_text(json.dumps(runlist, indent=2) + "\n", encoding="utf-8")
+
+
 def add_runtime_file(source, rootfs, absolute):
     destination = rootfs / absolute.lstrip("/")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -365,6 +451,8 @@ def stage_runtime(artifact_root, rootfs, target, suites, args):
 
     executables = []
     for suite in suites:
+        if suite in ("wasi", "wasi-smoke"):
+            continue
         suite_root = artifact_root / suite / target
         for path in suite_root.iterdir():
             if path.is_file() and not path.name.startswith(".") and elf_executable(path):
@@ -405,12 +493,12 @@ def build(args):
     image = output_dir / f"test-{target}.img"
     image.unlink(missing_ok=True)
     suites = args.suite.split(",") if args.suite != "all" else [
-        "libctest", "picolibc", "openposix", "busybox"]
+        "libctest", "picolibc", "openposix", "busybox", "wasi"]
     if not suites or len(set(suites)) != len(suites):
         raise RuntimeError("SUITE must be a non-empty, duplicate-free list")
     if "ltp" in suites:
         raise RuntimeError("LTP is not a supported suite; select openposix instead")
-    unknown = sorted(set(suites) - {"libctest", "picolibc", "openposix", "busybox"})
+    unknown = sorted(set(suites) - {"libctest", "picolibc", "openposix", "busybox", "wasi", "wasi-smoke"})
     if unknown:
         raise RuntimeError("unknown suites: " + ", ".join(unknown))
     if "openposix" in suites:
@@ -429,6 +517,9 @@ def build(args):
                 build_picolibc(target, output_dir, artifact_root, args)
             elif suite == "openposix":
                 build_openposix(target, output_dir, artifact_root, args)
+            elif suite in ("wasi", "wasi-smoke"):
+                build_wasi(target, output_dir, artifact_root, args,
+                           smoke=(suite == "wasi-smoke"), suite=suite)
             else:
                 build_busybox(target, output_dir, artifact_root, args)
         except (OSError, RuntimeError, subprocess.CalledProcessError, tarfile.TarError) as error:
