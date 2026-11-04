@@ -15,7 +15,7 @@ from shell_image import prepare
 
 def command(args):
     try:
-        return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT)
+        return subprocess.check_output(args, stdin=subprocess.DEVNULL, text=True, stderr=subprocess.STDOUT)
     except FileNotFoundError as error:
         raise RuntimeError(f"missing host tool: {args[0]}") from error
     except subprocess.CalledProcessError as error:
@@ -28,6 +28,16 @@ def set_difference(expected, actual):
     return f"missing={missing[:8]} (+{max(0, len(missing) - 8)}), extra={extra[:8]} (+{max(0, len(extra) - 8)})"
 
 
+def fat_component(name):
+    if "." in name:
+        stem, ext = name.rsplit(".", 1)
+        stem = re.sub(r"[^A-Z0-9_~-]", "", stem.upper())[:8] or "DIR"
+        ext = re.sub(r"[^A-Z0-9_~-]", "", ext.upper())[:3]
+        return f"{stem}.{ext}" if ext else stem
+    stem = re.sub(r"[^A-Z0-9_~-]", "", name.upper())[:8] or "DIR"
+    return stem
+
+
 def entries(root, suites, arch, filesystem="fat"):
     result = []
     used_names = {}
@@ -35,28 +45,110 @@ def entries(root, suites, arch, filesystem="fat"):
         suite_root = root / suite / arch
         if not suite_root.is_dir():
             raise RuntimeError(f"no {arch} artifacts for suite {suite}; build it first")
-        files = sorted(path for path in suite_root.iterdir()
-                       if path.is_file() and not path.name.startswith("."))
-        used = used_names.setdefault(suite, set())
-        for path in files:
-            source_relative = path.relative_to(root).as_posix()
-            header = path.read_bytes()[:20]
-            kind = "ELF" if header[:4] == b"\x7fELF" else "DATA"
-            if filesystem == "ext4":
-                image_relative = f"{suite}/{path.name}"
-            else:
-                extension = "ELF" if kind == "ELF" else "DAT"
-                stem = re.sub(r"[^A-Z0-9]", "", path.stem.upper()) or "TEST"
-                base = stem[:8]
-                candidate = f"{base}.{extension}"
-                suffix = 1
-                while candidate in used:
-                    tail = str(suffix)
-                    candidate = f"{base[:8-len(tail)]}{tail}.{extension}"
-                    suffix += 1
-                used.add(candidate)
-                image_relative = f"{suite}/{candidate}"
-            result.append((path, source_relative, image_relative, kind))
+        all_files = sorted(
+            p for p in suite_root.rglob("*")
+            if p.is_file() and not (p.name.startswith(".") and p.name not in (".keep", ".gitignore"))
+        )
+        if filesystem == "ext4":
+            for path in all_files:
+                source_relative = path.relative_to(root).as_posix()
+                header = path.read_bytes()[:20]
+                if header[:4] == b"\x7fELF":
+                    kind = "ELF"
+                elif header[:4] == b"\x00asm":
+                    kind = "WASM"
+                else:
+                    kind = "DATA"
+                rel_inside = path.relative_to(suite_root).as_posix()
+                image_relative = f"{suite}/{rel_inside}"
+                result.append((path, source_relative, image_relative, kind))
+        else:
+            by_dir = {}
+            for path in all_files:
+                rel_dir = path.relative_to(suite_root).parent
+                by_dir.setdefault(rel_dir, []).append(path)
+
+            for rel_dir, files in by_dir.items():
+                dir_key = f"{suite}/{rel_dir.as_posix()}" if rel_dir.parts else suite
+                used_in_dir = used_names.setdefault(dir_key, set())
+                used_stems = set()
+                stem_map = {}
+
+                wasms = [f for f in files if f.suffix.lower() == ".wasm" or f.read_bytes()[:4] == b"\x00asm"]
+                others = [f for f in files if f not in wasms]
+
+                for path in wasms:
+                    source_relative = path.relative_to(root).as_posix()
+                    kind = "WASM"
+                    clean_stem = re.sub(r"[^A-Z0-9_~-]", "", path.stem.upper()) or "TEST"
+                    base = clean_stem[:8]
+                    cand_stem = base
+                    suf = 1
+                    while cand_stem in used_stems or f"{cand_stem}.WAS" in used_in_dir:
+                        tail = str(suf)
+                        cand_stem = f"{base[:8-len(tail)]}{tail}"
+                        suf += 1
+                    used_stems.add(cand_stem)
+                    stem_map[path.stem] = cand_stem
+                    candidate = f"{cand_stem}.WAS"
+                    used_in_dir.add(candidate)
+
+                    fat_dir = "/".join(fat_component(p) for p in rel_dir.parts)
+                    image_relative = f"{suite}/{fat_dir}/{candidate}" if fat_dir else f"{suite}/{candidate}"
+                    result.append((path, source_relative, image_relative, kind))
+
+                for path in others:
+                    source_relative = path.relative_to(root).as_posix()
+                    header = path.read_bytes()[:20]
+                    if header[:4] == b"\x7fELF":
+                        kind = "ELF"
+                    elif header[:4] == b"\x00asm":
+                        kind = "WASM"
+                    else:
+                        kind = "DATA"
+
+                    if path.suffix.lower() == ".json":
+                        ext = "JSN"
+                        if path.stem in stem_map:
+                            candidate = f"{stem_map[path.stem]}.{ext}"
+                        else:
+                            clean_stem = re.sub(r"[^A-Z0-9_~-]", "", path.stem.upper()) or "DATA"
+                            base = clean_stem[:8]
+                            cand_stem = base
+                            suf = 1
+                            while cand_stem in used_stems or f"{cand_stem}.{ext}" in used_in_dir:
+                                tail = str(suf)
+                                cand_stem = f"{base[:8-len(tail)]}{tail}"
+                                suf += 1
+                            used_stems.add(cand_stem)
+                            candidate = f"{cand_stem}.{ext}"
+                    elif path.name.startswith("."):
+                        clean_stem = re.sub(r"[^A-Z0-9_~-]", "", path.name[1:].upper()) or "DATA"
+                        base = clean_stem[:8]
+                        candidate = f"{base}.DAT"
+                    elif path.suffix:
+                        ext = re.sub(r"[^A-Z0-9_~-]", "", path.suffix[1:].upper())[:3] or "DAT"
+                        clean_stem = re.sub(r"[^A-Z0-9_~-]", "", path.stem.upper()) or "FILE"
+                        base = clean_stem[:8]
+                        candidate = f"{base}.{ext}"
+                    else:
+                        clean_stem = re.sub(r"[^A-Z0-9_~-]", "", path.stem.upper()) or "FILE"
+                        candidate = clean_stem[:8]
+
+                    if candidate in used_in_dir:
+                        base_part, *ext_parts = candidate.split(".", 1)
+                        ext_part = f".{ext_parts[0]}" if ext_parts else ""
+                        suf = 1
+                        while candidate in used_in_dir:
+                            tail = str(suf)
+                            candidate = f"{base_part[:8-len(tail)]}{tail}{ext_part}"
+                            suf += 1
+                    used_in_dir.add(candidate)
+
+                    fat_dir = "/".join(fat_component(p) for p in rel_dir.parts)
+                    image_relative = f"{suite}/{fat_dir}/{candidate}" if fat_dir else f"{suite}/{candidate}"
+                    result.append((path, source_relative, image_relative, kind))
+
     if not result:
         raise RuntimeError("selected suites produced no files")
     return result
@@ -105,11 +197,14 @@ def pack(args):
     output.parent.mkdir(parents=True, exist_ok=True)
     output.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="kaleidos-test-image-") as temporary:
-        selected, cases_file = prepare(args.input.resolve(), args.suites.split(","),
-                                       args.arch, selected, Path(temporary) / "shell")
+        selected, cases_file, wasi_manifest_file, wasi_json_file = prepare(
+            args.input.resolve(), args.suites.split(","),
+            args.arch, selected, Path(temporary) / "shell")
         selected += runtime_entries(runtime_root, args.fs)
         image = Path(temporary) / "tests.img"
         payload_bytes = sum(source.stat().st_size for source, *_rest in selected)
+        if wasi_manifest_file:
+            payload_bytes += wasi_manifest_file.stat().st_size + wasi_json_file.stat().st_size
         reserve = max(4 * 1024 * 1024, payload_bytes // 8)
         image_bytes = max(64 * 1024 * 1024, payload_bytes + reserve + 32 * 1024 * 1024)
         image_bytes = ((image_bytes + 16 * 1024 * 1024 - 1) // (16 * 1024 * 1024)) * 16 * 1024 * 1024
@@ -150,9 +245,15 @@ def pack(args):
                         created.add(parent)
             for source, _source_relative, image_relative, _kind in selected:
                 command(["mcopy", "-o", "-i", str(image), str(source), f"::/{image_relative}"])
-            for source, destination in ((harness, "RUNTEST.SH"),
-                                        (runlist_file, "RUNLIST.TXT"),
-                                        (tests_file, "TESTS.TXT")):
+            root_copies = [
+                (harness, "RUNTEST.SH"),
+                (runlist_file, "RUNLIST.TXT"),
+                (tests_file, "TESTS.TXT"),
+            ]
+            if wasi_manifest_file:
+                root_copies.append((wasi_manifest_file, "WASIRUN.TXT"))
+                root_copies.append((wasi_json_file, "WASIRUN.JSN"))
+            for source, destination in root_copies:
                 command(["mcopy", "-o", "-i", str(image), str(source), f"::/{destination}"])
         else:
             stage = Path(temporary) / "ext4-root"
@@ -165,6 +266,9 @@ def pack(args):
             shutil.copy2(harness, stage / "RUNTEST.SH")
             shutil.copy2(runlist_file, stage / "RUNLIST.TXT")
             shutil.copy2(tests_file, stage / "TESTS.TXT")
+            if wasi_manifest_file:
+                shutil.copy2(wasi_manifest_file, stage / "WASIRUN.TXT")
+                shutil.copy2(wasi_json_file, stage / "WASIRUN.JSON")
             command(["mke2fs", "-q", "-F", "-t", "ext4", "-L", "KALEIDOST",
                      "-b", "4096", "-I", "256", "-O", "64bit,metadata_csum,^orphan_file",
                      "-d", str(stage), str(image)])
@@ -176,24 +280,47 @@ def pack(args):
 def verify(args):
     found = entries(args.input.resolve(), args.suites.split(","), args.arch, args.fs)
     with tempfile.TemporaryDirectory(prefix="kaleidos-shell-verify-") as temporary:
-        found, cases_file = prepare(args.input.resolve(), args.suites.split(","),
-                                    args.arch, found, Path(temporary))
+        found, cases_file, wasi_manifest_file, wasi_json_file = prepare(
+            args.input.resolve(), args.suites.split(","),
+            args.arch, found, Path(temporary))
         found += runtime_entries(args.runtime.resolve(), args.fs)
-        return verify_prepared(args, found, cases_file)
+        return verify_prepared(args, found, cases_file, wasi_manifest_file, wasi_json_file)
 
 
-def verify_prepared(args, found, cases_file):
+def verify_wasirun(manifest, expected_files, expected_directories=None):
+    if manifest is None:
+        return
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        fields = line.split("|")
+        if len(fields) != 11:
+            raise RuntimeError(f"invalid wasi run manifest row (expected 11 fields): {line}")
+        test_id, suite, version, lang, name, wasm_path, json_path, root_dir, exit_code, status, reason = fields
+        if wasm_path not in expected_files:
+            raise RuntimeError(f"WASI wasm artifact missing from image: {wasm_path} in {line}")
+        if json_path != "-" and json_path not in expected_files:
+            raise RuntimeError(f"WASI json config missing from image: {json_path} in {line}")
+        if root_dir != "-" and expected_directories is not None and root_dir not in expected_directories:
+            raise RuntimeError(f"WASI fixture root missing from image: {root_dir} in {line}")
+
+
+def verify_prepared(args, found, cases_file, wasi_manifest_file=None, wasi_json_file=None):
     image = args.image.resolve()
     if not image.is_file():
         raise RuntimeError(f"image not found: {image}")
     if args.fs == "ext4":
-        return verify_ext4(args, image, found, cases_file)
+        return verify_ext4(args, image, found, cases_file, wasi_manifest_file, wasi_json_file)
     if args.fs != "fat":
         raise RuntimeError("FS must be fat or ext4")
     listing = command(["mdir", "-i", str(image), "::/"])
     for required in (r"TESTS\s+TXT", r"RUNLIST\s+TXT", r"RUNTEST\s+SH"):
         if not re.search(required, listing):
             raise RuntimeError(f"FAT root file is missing: {required}")
+    if wasi_manifest_file:
+        for required in (r"WASIRUN\s+TXT", r"WASIRUN\s+JSN"):
+            if not re.search(required, listing):
+                raise RuntimeError(f"FAT root file is missing: {required}")
     recursive = command(["mdir", "-s", "-/", "-i", str(image), "::/"])
     current_directory = ""
     actual_files = set()
@@ -205,7 +332,7 @@ def verify_prepared(args, found, cases_file):
             if current_directory:
                 actual_directories.add(current_directory)
             continue
-        file_entry = re.match(r"([A-Z0-9_~]{1,8})(?:\s+([A-Z0-9_~]{1,3}))?\s+\d+\s", line)
+        file_entry = re.match(r"([A-Z0-9_~-]{1,8})(?:\s+([A-Z0-9_~-]{1,3}))?\s+\d+\s", line)
         if file_entry:
             name = file_entry.group(1)
             if file_entry.group(2):
@@ -213,6 +340,9 @@ def verify_prepared(args, found, cases_file):
             actual_files.add(f"{current_directory}/{name}" if current_directory else name)
     expected_files = {image_relative for _source, _source_relative, image_relative, _kind in found}
     expected_files.update({"TESTS.TXT", "RUNLIST.TXT", "RUNTEST.SH", "ABI.TXT"})
+    if wasi_manifest_file:
+        expected_files.add("WASIRUN.TXT")
+        expected_files.add("WASIRUN.JSN")
     expected_directories = set()
     for relative in expected_files:
         parts = Path(relative).parts[:-1]
@@ -233,7 +363,7 @@ def verify_prepared(args, found, cases_file):
         directories = sorted({str(Path(path).parent) for path in expected_files if "/" in path})
         for directory in directories:
             listing = command(["mdir", "-i", str(image), f"::/{directory}"])
-            aliases = re.findall(r"^([A-Z0-9_~]{1,8})(?:\s+([A-Z0-9_~]{1,3}))?\s+\d+\s",
+            aliases = re.findall(r"^([A-Z0-9_~-]{1,8})(?:\s+([A-Z0-9_~-]{1,3}))?\s+\d+\s",
                                  listing, re.MULTILINE)
             short_names = [f"{base}.{extension}" if extension else base
                            for base, extension in aliases]
@@ -244,12 +374,14 @@ def verify_prepared(args, found, cases_file):
         for source, source_relative, image_relative, kind in found:
             extracted = destination / image_relative
             extracted.parent.mkdir(parents=True, exist_ok=True)
+            extracted.unlink(missing_ok=True)
             command(["mcopy", "-i", str(image), f"::/{image_relative}", str(extracted)])
             original = source
             if extracted.stat().st_size != original.stat().st_size:
                 raise RuntimeError(f"size changed in FAT image: {image_relative}")
             command(["cmp", "--", str(original), str(extracted)])
-            if args.run_native and suite == "libctest" and args.arch == "x86_64" and kind == "ELF":
+            suite_name = image_relative.split("/", 1)[0]
+            if args.run_native and suite_name == "libctest" and args.arch == "x86_64" and kind == "ELF":
                 extracted.chmod(0o755)
                 run_directory = destination / ("run-" + source_relative.replace("/", "_"))
                 run_directory.mkdir()
@@ -271,19 +403,28 @@ def verify_prepared(args, found, cases_file):
                 if process.returncode != 0:
                     raise RuntimeError(f"extracted Linux reference exited {process.returncode}: {source_relative}")
         test_list = destination / "TESTS.TXT"
+        test_list.unlink(missing_ok=True)
         command(["mcopy", "-i", str(image), "::/TESTS.TXT", str(test_list)])
         declared = test_list.read_text(encoding="ascii")
         for _source, source_relative, image_relative, _kind in found:
             if image_relative not in declared or f"source {source_relative}" not in declared:
                 raise RuntimeError(f"missing manifest mapping: {source_relative}")
-        for root_file, source in (("RUNLIST.TXT", cases_file),
-                                  ("RUNTEST.SH", Path(__file__).with_name("testharness.sh")),
-                                  ("ABI.TXT", args.runtime.resolve() / "ABI.TXT")):
+        root_verifications = [
+            ("RUNLIST.TXT", cases_file),
+            ("RUNTEST.SH", Path(__file__).with_name("testharness.sh")),
+            ("ABI.TXT", args.runtime.resolve() / "ABI.TXT"),
+        ]
+        if wasi_manifest_file:
+            root_verifications.append(("WASIRUN.TXT", wasi_manifest_file))
+            root_verifications.append(("WASIRUN.JSN", wasi_json_file))
+        for root_file, source in root_verifications:
             extracted_root = destination / root_file
+            extracted_root.unlink(missing_ok=True)
             command(["mcopy", "-i", str(image), f"::/{root_file}", str(extracted_root)])
             if source.read_bytes() != extracted_root.read_bytes():
                 raise RuntimeError(f"{root_file} differs from the source")
         verify_runlist(cases_file, expected_files)
+        verify_wasirun(wasi_manifest_file, expected_files, expected_directories)
         if reference_rows and log_root:
             report = ["path\tstatus\texit_status"]
             report.extend(f"{path}\t{status}\t{code}" for path, status, code in reference_rows)
@@ -293,12 +434,15 @@ def verify_prepared(args, found, cases_file):
     return 0
 
 
-def verify_ext4(args, image, found, cases_file):
+def verify_ext4(args, image, found, cases_file, wasi_manifest_file=None, wasi_json_file=None):
     with tempfile.TemporaryDirectory(prefix="kaleidos-ext4-verify-") as temporary:
         destination = Path(temporary)
         command(["debugfs", "-R", f"rdump / {destination}", str(image)])
         expected_files = {image_relative for _source, _source_relative, image_relative, _kind in found}
         expected_files.update({"TESTS.TXT", "RUNLIST.TXT", "RUNTEST.SH"})
+        if wasi_manifest_file:
+            expected_files.add("WASIRUN.TXT")
+            expected_files.add("WASIRUN.JSON")
         actual_files = {path.relative_to(destination).as_posix()
                         for path in destination.rglob("*") if path.is_file()}
         if actual_files != expected_files:
@@ -323,12 +467,19 @@ def verify_ext4(args, image, found, cases_file):
         for _source, source_relative, image_relative, _kind in found:
             if image_relative not in declared or f"source {source_relative}" not in declared:
                 raise RuntimeError(f"missing manifest mapping: {source_relative}")
-        for root_file, source in (("RUNLIST.TXT", cases_file),
-                                  ("RUNTEST.SH", Path(__file__).with_name("testharness.sh")),
-                                  ("ABI.TXT", args.runtime.resolve() / "ABI.TXT")):
+        root_verifications = [
+            ("RUNLIST.TXT", cases_file),
+            ("RUNTEST.SH", Path(__file__).with_name("testharness.sh")),
+            ("ABI.TXT", args.runtime.resolve() / "ABI.TXT"),
+        ]
+        if wasi_manifest_file:
+            root_verifications.append(("WASIRUN.TXT", wasi_manifest_file))
+            root_verifications.append(("WASIRUN.JSON", wasi_json_file))
+        for root_file, source in root_verifications:
             if source.read_bytes() != (destination / root_file).read_bytes():
                 raise RuntimeError(f"{root_file} differs from the source")
         verify_runlist(cases_file, expected_files)
+        verify_wasirun(wasi_manifest_file, expected_files)
     print(f"ext4 verified: {image} ({len(found)} artifacts readable and identical)")
     return 0
 

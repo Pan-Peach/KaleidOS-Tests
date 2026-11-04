@@ -8,9 +8,12 @@ import tarfile
 
 
 def prepare(root, suites, isa, selected, temporary):
+    temporary.mkdir(parents=True, exist_ok=True)
     paths = {original: image for _source, original, image, _kind in selected}
     generated = []
     manifest = []
+    wasi_manifest = []
+    wasi_records = []
     archives = set()
 
     def asset(suite, name, contents, kind="DATA", original=None):
@@ -111,6 +114,51 @@ def prepare(root, suites, isa, selected, temporary):
                         commands = f"cp {image_path(relative)} ./case.elf\nchmod +x ./case.elf\nexec ./case.elf " + " ".join(map(shlex.quote, args))
                         case(suite, abi, libc, logical, commands,
                              item.get("timeout", 60), requires=requires)
+        elif suite in ("wasi", "wasi-smoke"):
+            for item in data:
+                wasm_rel = paths.get(item.get("source"))
+                if not wasm_rel:
+                    raise RuntimeError(f"missing wasm artifact in image mapping: {item.get('source')}")
+                json_rel = paths.get(item.get("config")) if item.get("config") else "-"
+
+                root_rel = None
+                if item.get("root"):
+                    prefix = item["root"] + "/"
+                    for orig, img in paths.items():
+                        if orig.startswith(prefix):
+                            orig_rel_to_fixture = orig[len(prefix):]
+                            depth = orig_rel_to_fixture.count("/") + 1
+                            img_parts = Path(img).parts
+                            root_rel = "/".join(img_parts[:-depth])
+                            break
+                    if not root_rel:
+                        if "/fs-tests.dir" in item["root"]:
+                            sub_lang = Path(item["source"]).parent.name
+                            root_rel = f"{suite}/{sub_lang}/fs-tests.dir"
+
+                number = len(wasi_records) + 1
+                wasi_id = f"W{number:07d}"
+                wasi_records.append({
+                    "id": wasi_id,
+                    "suite": suite,
+                    "version": item.get("abi", "wasm32-wasip1"),
+                    "language": item.get("language", "unknown"),
+                    "name": item.get("name", suite),
+                    "source": item.get("source", ""),
+                    "wasm_path": wasm_rel,
+                    "json_path": json_rel if json_rel != "-" else None,
+                    "root_dir": root_rel,
+                    "expected_exit": item.get("exit_code", 0),
+                    "status": item.get("status", "BUILT"),
+                    "reason": item.get("reason", "-"),
+                    "args": item.get("args", []),
+                    "env": item.get("env", {}),
+                })
+                wasi_manifest.append(
+                    f"{wasi_id}|{suite}|{item.get('abi', 'wasm32-wasip1')}|{item.get('language', 'unknown')}|"
+                    f"{item.get('name', suite)}|{wasm_rel}|{json_rel}|{root_rel or '-'}|"
+                    f"{item.get('exit_code', 0)}|{item.get('status', 'BUILT')}|{item.get('reason', '-')}"
+                )
         else:
             for item in data:
                 relative = paths.get(item.get("source"))
@@ -127,12 +175,21 @@ def prepare(root, suites, isa, selected, temporary):
                     commands += "exec ./case.elf " + " ".join(shlex.quote(str(arg)) for arg in item.get("args", []))
                     case(suite, abi, libc, item.get("name", item.get("source", suite)), commands,
                      item.get("timeout", 30), status, item.get("reason", "-"))
-    if not manifest:
+    if not manifest and not wasi_records:
         raise RuntimeError("selected artifacts have no execution entries")
     cases_file = temporary / "RUNLIST.TXT"
-    cases_file.write_text("\n".join(manifest) + "\n")
+    cases_file.write_text("\n".join(manifest) + ("\n" if manifest else ""))
+
+    wasi_manifest_file = None
+    wasi_json_file = None
+    if wasi_records:
+        wasi_manifest_file = temporary / "WASIRUN.TXT"
+        wasi_manifest_file.write_text("\n".join(wasi_manifest) + "\n", encoding="utf-8")
+        wasi_json_file = temporary / "WASIRUN.JSON"
+        wasi_json_file.write_text(json.dumps(wasi_records, indent=2) + "\n", encoding="utf-8")
+
     result = [entry for entry in selected if entry[1] not in archives] + generated
     image_names = [entry[2] for entry in result]
     if len(set(image_names)) != len(image_names):
         raise RuntimeError("generated shell assets collide with image filenames")
-    return result, cases_file
+    return result, cases_file, wasi_manifest_file, wasi_json_file
